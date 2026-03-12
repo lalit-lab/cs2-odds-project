@@ -132,13 +132,12 @@ class OddsScraper:
             print(f"[HLTV] configUrl raw: {cfg_resp.text[:500]}")
             return []
 
-        print(f"[HLTV] Config top-level keys: {list(config.keys())[:15]}")
+        # Log the first few key→value pairs so we can see the URL structure
+        for k, v in list(config.items())[:6]:
+            print(f"[HLTV] config[{k!r}] = {str(v)[:200]}")
 
-        # ── Step 3: extract odds from config or via AJAX ──────────────
-        results = self._extract_odds_from_config(config, nonce)
-        if not results:
-            # Config didn't have inline odds — try AJAX call
-            results = self._fetch_odds_via_ajax(config, nonce)
+        # ── Step 3: config values are URLs to JSON data files ─────────
+        results = self._fetch_offers_data(config)
         return results
 
     # ──────────────────────────────────────────────────────────────────
@@ -173,159 +172,136 @@ class OddsScraper:
 
         return nonce, config_url
 
-    def _extract_odds_from_config(self, config: dict, nonce: str) -> List[Dict]:
+    def _fetch_offers_data(self, config: dict) -> List[Dict]:
         """
-        Some widget configs include inline odds data.
-        Try common key names.
+        The update_cache_config.json values are URLs to JSON data files.
+        'syncOffersData' → the main odds/offers file.
+        'syncOperatorsData' → bookmaker info.
+        Fetch them and parse odds.
         """
+        # Priority order: offers (match odds) > operators (bookmaker metadata)
+        url_keys = ["syncOffersData", "syncOperatorsData"]
+        # Also try region-specific alt-data (India, global)
+        for region in ["IN", "RU", "DE", "BR", "TR", "ID"]:
+            url_keys.append(f"bcblSyncAltData_{region}")
+
+        for key in url_keys:
+            val = config.get(key)
+            if not val:
+                continue
+            # Values can be a URL string OR a dict with a url key
+            url = None
+            if isinstance(val, str) and val.startswith("http"):
+                url = val
+            elif isinstance(val, dict):
+                url = val.get("url") or val.get("dataUrl") or val.get("file")
+
+            if not url:
+                print(f"[HLTV] {key} value is not a URL: {str(val)[:100]}")
+                continue
+
+            print(f"[HLTV] Fetching {key}: {url}")
+            try:
+                r = self._session.get(url, timeout=15)
+                print(f"[HLTV] {key} → {r.status_code}, {len(r.text)} chars: {r.text[:400]}")
+                if r.status_code == 200 and r.text.strip():
+                    try:
+                        data = r.json()
+                        results = self._parse_offers_json(data, key)
+                        if results:
+                            print(f"[HLTV] Parsed {len(results)} odds from {key}")
+                            return results
+                    except Exception as e:
+                        print(f"[HLTV] JSON parse error for {key}: {e}")
+            except Exception as e:
+                print(f"[HLTV] Fetch error for {key}: {e}")
+
+        return []
+
+    def _parse_offers_json(self, data, source_key: str) -> List[Dict]:
+        """
+        Parse the offers JSON — we log the shape so we can learn its structure.
+        Handles common BCB plugin formats.
+        """
+        # Log the top-level structure so we can see what we're working with
+        if isinstance(data, dict):
+            print(f"[HLTV] offers keys: {list(data.keys())[:10]}")
+        elif isinstance(data, list):
+            print(f"[HLTV] offers is a list of {len(data)} items")
+            if data and isinstance(data[0], dict):
+                print(f"[HLTV] first item keys: {list(data[0].keys())[:10]}")
+                print(f"[HLTV] first item sample: {str(data[0])[:300]}")
+
         results = []
 
-        # Try to find match/event data at common keys
-        matches = (
-            config.get("matches") or
-            config.get("events") or
-            config.get("games") or
-            config.get("data") or
-            []
-        )
-
-        if not matches:
-            print(f"[HLTV] Config has no inline matches. Keys: {list(config.keys())}")
+        # Unwrap common wrapper shapes
+        if isinstance(data, dict):
+            # Try to find the list of matches/events/offers
+            items = (
+                data.get("offers") or data.get("matches") or data.get("events") or
+                data.get("games") or data.get("data") or data.get("items") or
+                data.get("results") or []
+            )
+            if not items:
+                # Maybe data itself is a mapping of match_id → match_data
+                items = list(data.values()) if data else []
+        elif isinstance(data, list):
+            items = data
+        else:
             return []
 
-        print(f"[HLTV] Config has {len(matches)} inline entries")
-        # Log the first entry so we learn its shape
-        if matches:
-            print(f"[HLTV] First entry keys: {list(matches[0].keys()) if isinstance(matches[0], dict) else matches[0]}")
-
-        for match in matches:
-            if not isinstance(match, dict):
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            team_a = match.get("team1") or match.get("home") or match.get("teamA") or ""
-            team_b = match.get("team2") or match.get("away") or match.get("teamB") or ""
+
+            # Try to extract team names
+            team_a = (
+                item.get("team1") or item.get("home_team") or item.get("teamA") or
+                item.get("team1_name") or item.get("participant1") or
+                (item.get("teams") or [{}])[0].get("name", "") if item.get("teams") else ""
+            )
+            team_b = (
+                item.get("team2") or item.get("away_team") or item.get("teamB") or
+                item.get("team2_name") or item.get("participant2") or
+                (item.get("teams") or [{}, {}])[1].get("name", "") if item.get("teams") else ""
+            )
+
             if not team_a or not team_b:
                 continue
-            bookmakers = match.get("bookmakers") or match.get("odds") or []
+
+            # Try to extract bookmaker odds
+            bookmakers = (
+                item.get("bookmakers") or item.get("odds") or
+                item.get("operators") or item.get("markets") or []
+            )
             for bm in bookmakers:
                 if not isinstance(bm, dict):
                     continue
-                bm_name = bm.get("name") or bm.get("bookmaker") or ""
-                try:
-                    odds_a = round(float(bm.get("odds1") or bm.get("oddsHome") or bm.get("team1") or 0), 2)
-                    odds_b = round(float(bm.get("odds2") or bm.get("oddsAway") or bm.get("team2") or 0), 2)
-                except (ValueError, TypeError):
-                    continue
-                if odds_a and odds_b:
-                    results.append({
-                        "source": bm_name,
-                        "team_a": team_a,
-                        "team_b": team_b,
-                        "team_a_odds": odds_a,
-                        "team_b_odds": odds_b,
-                        "match_time": datetime.utcnow().isoformat(),
-                    })
-        return results
-
-    def _fetch_odds_via_ajax(self, config: dict, nonce: str) -> List[Dict]:
-        """
-        Call bcwp.hltv.org/wp-admin/admin-ajax.php to get odds.
-        Try common WordPress action names used by betting widgets.
-        """
-        results = []
-
-        # Common actions used by BCB (Betting Content Builder) plugins
-        actions_to_try = [
-            "bcb_get_events",
-            "bcb_get_odds",
-            "bcb_get_matches",
-            "get_betting_data",
-            "bcb_load_block",
-        ]
-
-        # Some configs embed the action name
-        action = (
-            config.get("action") or
-            config.get("ajax_action") or
-            config.get("wp_action")
-        )
-        if action:
-            actions_to_try.insert(0, action)
-
-        for act in actions_to_try:
-            try:
-                r = self._session.post(
-                    AJAX_URL,
-                    data={
-                        "action": act,
-                        "security": nonce,
-                        "nonce": nonce,
-                    },
-                    timeout=10,
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": "https://www.hltv.org/betting/money",
-                        "Origin": "https://www.hltv.org",
-                    },
+                bm_name = (
+                    bm.get("name") or bm.get("bookmaker") or
+                    bm.get("operator") or bm.get("title") or ""
                 )
-                print(f"[HLTV AJAX] action={act} → {r.status_code}: {r.text[:300]}")
-                if r.status_code == 200 and r.text.strip() not in ("-1", "0", ""):
-                    try:
-                        payload = r.json()
-                        parsed = self._parse_ajax_response(payload)
-                        if parsed:
-                            print(f"[HLTV AJAX] action={act} returned {len(parsed)} odds entries")
-                            results = parsed
-                            break
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"[HLTV AJAX] action={act} error: {e}")
-
-        return results
-
-    def _parse_ajax_response(self, payload) -> List[Dict]:
-        """Parse whatever the AJAX endpoint returns."""
-        results = []
-
-        # payload could be a list of matches, or {"data": [...], "success": true}, etc.
-        if isinstance(payload, dict):
-            payload = (
-                payload.get("data") or
-                payload.get("matches") or
-                payload.get("events") or
-                []
-            )
-
-        if not isinstance(payload, list):
-            print(f"[HLTV AJAX] Unexpected payload type: {type(payload)}")
-            return []
-
-        for match in payload:
-            if not isinstance(match, dict):
-                continue
-            team_a = match.get("team1") or match.get("home") or match.get("teamA") or ""
-            team_b = match.get("team2") or match.get("away") or match.get("teamB") or ""
-            if not team_a or not team_b:
-                continue
-            for bm in (match.get("bookmakers") or match.get("odds") or []):
-                if not isinstance(bm, dict):
-                    continue
-                bm_name = bm.get("name") or bm.get("bookmaker") or ""
                 try:
-                    odds_a = round(float(bm.get("odds1") or bm.get("oddsHome") or 0), 2)
-                    odds_b = round(float(bm.get("odds2") or bm.get("oddsAway") or 0), 2)
+                    odds_a = round(float(
+                        bm.get("odds1") or bm.get("home") or bm.get("team1") or
+                        bm.get("odd1") or bm.get("win1") or 0
+                    ), 2)
+                    odds_b = round(float(
+                        bm.get("odds2") or bm.get("away") or bm.get("team2") or
+                        bm.get("odd2") or bm.get("win2") or 0
+                    ), 2)
                 except (ValueError, TypeError):
                     continue
-                if odds_a and odds_b:
+                if odds_a > 1.0 and odds_b > 1.0:
                     results.append({
                         "source": bm_name,
-                        "team_a": team_a,
-                        "team_b": team_b,
+                        "team_a": str(team_a),
+                        "team_b": str(team_b),
                         "team_a_odds": odds_a,
                         "team_b_odds": odds_b,
                         "match_time": datetime.utcnow().isoformat(),
                     })
+
         return results
 
     # ──────────────────────────────────────────────────────────────────
