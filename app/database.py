@@ -7,12 +7,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/cs2_odds")
+_db_url = os.getenv("DATABASE_URL", "")
 
-#DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./cs2_odds.db")
+# Railway injects postgres:// but SQLAlchemy needs postgresql://
+if _db_url.startswith("postgres://"):
+    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 
+# Fall back to SQLite if no DATABASE_URL is set (local dev / Railway without PG plugin)
+DATABASE_URL = _db_url if _db_url else "sqlite:///./cs2_odds.db"
 
-engine = create_engine(DATABASE_URL)
+_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=_connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

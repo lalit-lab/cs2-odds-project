@@ -1,8 +1,9 @@
 [build]
 builder = "nixpacks"
+buildCommand = "playwright install-deps chromium && playwright install chromium"
 
 [deploy]
-startCommand = "playwright install chromium && python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+startCommand = "python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
-healthcheckTimeout = 60
+healthcheckTimeout = 120
 restartPolicyType = "on_failure"
