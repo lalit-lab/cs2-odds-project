@@ -1,35 +1,13 @@
 import asyncio
-import aiohttp
-import random
+import concurrent.futures
 import os
-import re
 from typing import List, Dict
-from datetime import datetime, timedelta
+from datetime import datetime
 from fuzzywuzzy import fuzz
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Fallback: Real CS2 teams currently active on the pro circuit
-REAL_CS2_TEAMS = [
-    "Natus Vincere", "FaZe Clan", "Team Vitality", "G2 Esports",
-    "Team Liquid", "Astralis", "Cloud9", "MOUZ", "Heroic", "ENCE",
-    "NIP", "Fnatic", "BIG", "OG", "paiN Gaming", "FURIA",
-    "Virtus.pro", "Spirit", "Apeks", "9z Team"
-]
-
-FIXED_MATCHES = [
-    ("Natus Vincere", "FaZe Clan"),
-    ("Team Vitality", "G2 Esports"),
-    ("Team Liquid", "MOUZ"),
-    ("Heroic", "Astralis"),
-    ("Cloud9", "NIP"),
-    ("FURIA", "paiN Gaming"),
-    ("Spirit", "Virtus.pro"),
-    ("ENCE", "Fnatic"),
-]
-
-# Bookmaker display names mapped from HLTV CSS class suffixes
 BOOKMAKER_NAMES = {
     "ggbet": "GGBet",
     "thunderpick": "Thunderpick",
@@ -52,138 +30,210 @@ BOOKMAKER_NAMES = {
 
 
 class OddsScraper:
-    def __init__(self):
-        self.odds_api_key = os.getenv("ODDS_API_KEY", "")
-        # On Railway/cloud, Playwright often hangs (no display server).
-        # Set HLTV_SCRAPE=true in Railway env vars to enable it there.
-        # Locally it always tries HLTV first.
-        self.use_playwright = os.getenv("RAILWAY_ENVIRONMENT") is None or \
-                              os.getenv("HLTV_SCRAPE", "false").lower() == "true"
+    """
+    Scrapes real CS2 odds from HLTV.org using a PERSISTENT browser session.
 
-    # ------------------------------------------------------------------
+    First load  : ~15-20s  (launches browser + Cloudflare bypass)
+    Subsequent  : ~4-6s    (just reloads the already-open page)
+
+    Also intercepts HLTV's own WebSocket connections — if HLTV pushes
+    real-time updates via WS, those frames are captured and logged.
+    In a future iteration, we can connect directly to that WS endpoint
+    without needing the browser at all.
+
+    No mock data — returns [] if scraping fails so the UI shows an honest
+    "no data" state rather than fake numbers.
+    """
+
+    def __init__(self):
+        # Single-threaded executor keeps the browser in ONE thread (Playwright sync is not thread-safe)
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hltv_browser"
+        )
+        self._browser = None
+        self._page = None
+        self._stealth_ctx = None
+        self._pw_ctx = None
+        self._initialized = False
+        self._ws_urls: List[str] = []
+        self._ws_frames: List[str] = []
+
+    # ──────────────────────────────────────────────────────────────────
     # PUBLIC ENTRY POINT
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
 
     async def scrape_all_sites(self) -> List[Dict]:
         """
-        On local: scrapes real CS2 odds from HLTV via Playwright.
-        On Railway/cloud: uses realistic mock data with real team names.
-        Falls back to mock data if HLTV scraping fails or times out.
+        Real HLTV data only.
+        First call: launches browser (~20s). Every call after: page refresh (~5s).
         """
-        if self.use_playwright:
-            try:
+        try:
+            loop = asyncio.get_event_loop()
+            if not self._initialized:
+                print("[HLTV] Launching persistent browser (first time ~20s)...")
                 data = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, self._scrape_hltv_sync),
-                    timeout=40.0
+                    loop.run_in_executor(self._executor, self._init_and_scrape),
+                    timeout=55.0,
                 )
-                if data:
-                    print(f"[HLTV] Scraped {len(data)} entries from {len(set(d['source'] for d in data))} bookmakers")
-                    return self.normalize_team_names(data)
-                print("[HLTV] No data returned, using mock data")
-            except asyncio.TimeoutError:
-                print("[HLTV] Timed out after 40s, using mock data")
-            except Exception as e:
-                print(f"[HLTV] Failed: {e}, using mock data")
-        else:
-            print("[Scraper] Cloud mode — using realistic mock data")
+            else:
+                print("[HLTV] Refreshing page (persistent session ~5s)...")
+                data = await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, self._refresh_and_scrape),
+                    timeout=25.0,
+                )
 
-        data = await self._generate_realistic_mock()
-        return self.normalize_team_names(data)
+            if data:
+                print(f"[HLTV] {len(data)} odds entries from "
+                      f"{len(set(d['source'] for d in data))} bookmakers")
+                return self.normalize_team_names(data)
 
-    # ------------------------------------------------------------------
-    # HLTV SCRAPER  (playwright-stealth to bypass Cloudflare)
-    # ------------------------------------------------------------------
+            print("[HLTV] Page loaded but no odds parsed yet")
 
-    def _scrape_hltv_sync(self) -> List[Dict]:
-        """
-        Synchronously scrape https://www.hltv.org/betting/money
-        using Playwright with stealth mode to bypass Cloudflare.
-        Returns list of odds entries with source, teams, and odds.
-        """
+        except asyncio.TimeoutError:
+            print("[HLTV] Timed out — resetting browser for next cycle")
+            self._executor.submit(self._reset_browser_sync)
+        except Exception as e:
+            print(f"[HLTV] Error: {e} — resetting browser")
+            self._executor.submit(self._reset_browser_sync)
+
+        return []   # real empty — no mock
+
+    # ──────────────────────────────────────────────────────────────────
+    # INIT  (runs in executor thread, ONCE)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _init_and_scrape(self) -> List[Dict]:
         from playwright.sync_api import sync_playwright
         from playwright_stealth import Stealth
-        from bs4 import BeautifulSoup
         import time
 
+        # Keep Stealth context alive (holds playwright process)
+        self._stealth_ctx = Stealth().use_sync(sync_playwright())
+        self._pw_ctx = self._stealth_ctx.__enter__()
+
+        self._browser = self._pw_ctx.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        self._page = self._browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+        )
+
+        # ── WebSocket interception ──────────────────────────────────────
+        # If HLTV pushes odds updates via WebSocket, we capture them here.
+        # Logged frames tell us the message format; with that we could
+        # connect directly via aiohttp WebSocket (no browser needed at all).
+        def _on_ws(ws):
+            print(f"[HLTV WS] Detected: {ws.url}")
+            self._ws_urls.append(ws.url)
+            ws.on(
+                "framereceived",
+                lambda payload: self._ws_frames.append(
+                    str(payload.get("payload", ""))[:500]
+                ),
+            )
+
+        self._page.on("websocket", _on_ws)
+        # ───────────────────────────────────────────────────────────────
+
+        self._page.goto("https://www.hltv.org/betting/money", timeout=30000)
+        time.sleep(5)
+        self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(2)
+        self._initialized = True
+        print("[HLTV] Persistent browser ready")
+
+        # Log any WebSocket findings
+        if self._ws_urls:
+            print(f"[HLTV WS] {len(self._ws_urls)} WebSocket(s) found: {self._ws_urls}")
+        if self._ws_frames:
+            print(f"[HLTV WS] Sample frame: {self._ws_frames[0]}")
+
+        return self._parse_page()
+
+    # ──────────────────────────────────────────────────────────────────
+    # REFRESH  (runs in executor thread, every subsequent call)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _refresh_and_scrape(self) -> List[Dict]:
+        import time
+
+        # Clear WS frames for this cycle
+        self._ws_frames = []
+
+        # Reload page — Cloudflare cookies already set → fast (~3-5s)
+        self._page.reload(timeout=15000, wait_until="domcontentloaded")
+        time.sleep(3)
+        self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1)
+
+        if self._ws_frames:
+            print(f"[HLTV WS] {len(self._ws_frames)} frames this cycle — "
+                  f"sample: {self._ws_frames[0][:150]}")
+
+        return self._parse_page()
+
+    # ──────────────────────────────────────────────────────────────────
+    # PAGE PARSER
+    # ──────────────────────────────────────────────────────────────────
+
+    def _parse_page(self) -> List[Dict]:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(self._page.content(), "html.parser")
         results = []
 
-        with Stealth().use_sync(sync_playwright()) as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            page = browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-            )
-            page.goto("https://www.hltv.org/betting/money", timeout=30000)
-            # Scroll to load all bookmaker columns
-            time.sleep(4)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(2)
-
-            soup = BeautifulSoup(page.content(), "html.parser")
-            browser.close()
-
-        # Parse the comparison table
-        # Structure: each b-match-container holds a bookmakerMatch table
-        # Rows: teamrow × 2 (team A and team B)
-        # Columns: bookmakerTeamBox + one cell per bookmaker (b-list-odds-provider-{name})
-        match_containers = soup.find_all("div", class_="b-match-container")
-
-        for mc in match_containers:
+        for mc in soup.find_all("div", class_="b-match-container"):
             table = mc.find("table", class_="bookmakerMatch")
             if not table:
                 continue
-
             rows = table.find_all("tr", class_="teamrow")
             if len(rows) != 2:
                 continue
 
-            # Extract team names
-            def get_team_name(row):
+            def _team(row):
                 box = row.find("td", class_="bookmakerTeamBox")
                 if not box:
                     return None
                 img = box.find("img")
                 if img and img.get("alt"):
                     return img["alt"].strip()
-                a_tag = box.find("a")
-                return a_tag.get_text(strip=True) if a_tag else None
+                a = box.find("a")
+                return a.get_text(strip=True) if a else None
 
-            team_a = get_team_name(rows[0])
-            team_b = get_team_name(rows[1])
+            team_a, team_b = _team(rows[0]), _team(rows[1])
             if not team_a or not team_b:
                 continue
 
-            # Extract odds per bookmaker from each cell
-            # Cell classes like: "odds b-list-odds b-list-odds-provider-ggbet"
-            row_a_cells = rows[0].find_all("td", class_="odds")
-            row_b_cells = rows[1].find_all("td", class_="odds")
-
-            for cell_a, cell_b in zip(row_a_cells, row_b_cells):
-                # Identify bookmaker from class
-                classes = cell_a.get("class", [])
-                bm_key = None
-                for cls in classes:
-                    if cls.startswith("b-list-odds-provider-"):
-                        bm_key = cls.replace("b-list-odds-provider-", "")
-                        break
+            for ca, cb in zip(
+                rows[0].find_all("td", class_="odds"),
+                rows[1].find_all("td", class_="odds"),
+            ):
+                bm_key = next(
+                    (
+                        c.replace("b-list-odds-provider-", "")
+                        for c in ca.get("class", [])
+                        if c.startswith("b-list-odds-provider-")
+                    ),
+                    None,
+                )
                 if not bm_key:
                     continue
 
                 bm_name = BOOKMAKER_NAMES.get(bm_key.lower(), bm_key.title())
-
-                # Extract odds values
-                odds_a_tag = cell_a.find("a")
-                odds_b_tag = cell_b.find("a")
-                if not odds_a_tag or not odds_b_tag:
+                tag_a, tag_b = ca.find("a"), cb.find("a")
+                if not tag_a or not tag_b:
                     continue
 
                 try:
-                    odds_a = float(odds_a_tag.get_text(strip=True))
-                    odds_b = float(odds_b_tag.get_text(strip=True))
+                    odds_a = round(float(tag_a.get_text(strip=True)), 2)
+                    odds_b = round(float(tag_b.get_text(strip=True)), 2)
                 except ValueError:
                     continue
 
@@ -191,88 +241,76 @@ class OddsScraper:
                     "source": bm_name,
                     "team_a": team_a,
                     "team_b": team_b,
-                    "team_a_odds": round(odds_a, 2),
-                    "team_b_odds": round(odds_b, 2),
+                    "team_a_odds": odds_a,
+                    "team_b_odds": odds_b,
                     "match_time": datetime.utcnow().isoformat(),
                 })
 
         return results
 
-    # ------------------------------------------------------------------
-    # ENHANCED MOCK DATA  (fallback — realistic CS2 teams + bookmaker spread)
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # BROWSER RESET
+    # ──────────────────────────────────────────────────────────────────
 
-    async def _generate_realistic_mock(self) -> List[Dict]:
-        tasks = [self._mock_bookmaker(bm) for bm in BOOKMAKER_NAMES.values()]
-        results = await asyncio.gather(*tasks)
-        all_results = []
-        for r in results:
-            all_results.extend(r)
-        return all_results
+    def _reset_browser_sync(self):
+        self._initialized = False
+        for obj, method in [
+            (self._browser, "close"),
+            (self._stealth_ctx, "__exit__"),
+        ]:
+            try:
+                if obj:
+                    if method == "__exit__":
+                        obj.__exit__(None, None, None)
+                    else:
+                        getattr(obj, method)()
+            except Exception:
+                pass
+        self._browser = None
+        self._page = None
+        self._pw_ctx = None
+        self._stealth_ctx = None
+        print("[HLTV] Browser reset — will re-init on next cycle")
 
-    async def _mock_bookmaker(self, bookmaker: str) -> List[Dict]:
-        await asyncio.sleep(random.uniform(0.05, 0.3))
-        entries = []
-        for team_a, team_b in FIXED_MATCHES:
-            base_prob_a = random.uniform(0.35, 0.65)
-            base_prob_b = 1 - base_prob_a
-            margin = random.uniform(0.04, 0.08)
-            odds_a = round(1 / (base_prob_a * (1 + margin / 2)), 2)
-            odds_b = round(1 / (base_prob_b * (1 + margin / 2)), 2)
-            noise = random.uniform(-0.05, 0.05)
-            odds_a = max(1.01, round(odds_a + noise, 2))
-            odds_b = max(1.01, round(odds_b - noise * 0.5, 2))
-            entries.append({
-                "source": bookmaker,
-                "team_a": team_a,
-                "team_b": team_b,
-                "team_a_odds": odds_a,
-                "team_b_odds": odds_b,
-                "match_time": (datetime.utcnow() + timedelta(hours=random.randint(1, 48))).isoformat(),
-            })
-        return entries
-
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
     # TEAM NAME NORMALIZER
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
 
     def normalize_team_names(self, odds_data: List[Dict]) -> List[Dict]:
         team_mappings = {
             "natus vincere": ["Na'Vi", "NAVI", "Natus Vincere", "NaVi"],
-            "faze clan": ["FaZe", "Faze Clan", "FAZE"],
-            "team liquid": ["Liquid", "Team Liquid", "TL"],
-            "g2 esports": ["G2", "G2 Esports", "G2 eSports"],
+            "faze clan":     ["FaZe", "Faze Clan", "FAZE"],
+            "team liquid":   ["Liquid", "Team Liquid", "TL"],
+            "g2 esports":    ["G2", "G2 Esports", "G2 eSports"],
             "team vitality": ["Vitality", "Team Vitality", "VIT"],
-            "astralis": ["Astralis", "AST"],
-            "cloud9": ["Cloud9", "C9"],
-            "mouz": ["MOUZ", "mousesports", "Mouz"],
-            "heroic": ["Heroic", "HER"],
-            "ence": ["ENCE"],
-            "nip": ["NIP", "Ninjas in Pyjamas", "Ninjas In Pyjamas"],
-            "fnatic": ["Fnatic", "fnatic"],
-            "spirit": ["Spirit", "Team Spirit"],
-            "virtus.pro": ["Virtus.pro", "VP", "virtus pro"],
-            "furia": ["FURIA", "Furia"],
-            "the mongolz": ["The MongolZ", "MongolZ"],
-            "legacy": ["Legacy", "Legacy (BR)"],
-            "fut": ["FUT", "FUT Esports"],
-            "bestia": ["BESTIA"],
-            "9ine": ["9INE"],
-            "m80": ["M80"],
+            "astralis":      ["Astralis", "AST"],
+            "cloud9":        ["Cloud9", "C9"],
+            "mouz":          ["MOUZ", "mousesports", "Mouz"],
+            "heroic":        ["Heroic"],
+            "ence":          ["ENCE"],
+            "nip":           ["NIP", "Ninjas in Pyjamas"],
+            "fnatic":        ["Fnatic"],
+            "spirit":        ["Spirit", "Team Spirit"],
+            "virtus.pro":    ["Virtus.pro", "VP"],
+            "furia":         ["FURIA"],
+            "the mongolz":   ["The MongolZ", "MongolZ"],
+            "legacy":        ["Legacy"],
+            "fut":           ["FUT", "FUT Esports"],
+            "bestia":        ["BESTIA"],
+            "9ine":          ["9INE"],
+            "m80":           ["M80"],
         }
 
-        def normalize_name(name: str) -> str:
-            name_lower = name.lower().strip()
+        def normalize(name: str) -> str:
+            nl = name.lower().strip()
             for canonical, variants in team_mappings.items():
-                if name_lower in [v.lower() for v in variants]:
+                if nl in [v.lower() for v in variants]:
                     return canonical.title()
-                for variant in variants:
-                    if fuzz.ratio(name_lower, variant.lower()) > 85:
-                        return canonical.title()
-            return name  # Keep original if no match found
+                if any(fuzz.ratio(nl, v.lower()) > 85 for v in variants):
+                    return canonical.title()
+            return name
 
-        for odds in odds_data:
-            odds["team_a"] = normalize_name(odds["team_a"])
-            odds["team_b"] = normalize_name(odds["team_b"])
-
+        for o in odds_data:
+            o["team_a"] = normalize(o["team_a"])
+            o["team_b"] = normalize(o["team_b"])
         return odds_data
