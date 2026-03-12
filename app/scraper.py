@@ -119,6 +119,9 @@ class OddsScraper:
 
         print(f"[HLTV] nonce={nonce}  configUrl={config_url}")
 
+        # ── Quick scan: is ANY odds data already in the raw HTML? ─────
+        self._scan_html_for_odds(html)
+
         # ── Step 2: fetch widget config JSON ──────────────────────────
         cfg_resp = self._session.get(config_url, timeout=15)
         if cfg_resp.status_code != 200:
@@ -171,6 +174,40 @@ class OddsScraper:
                 config_url = cm.group(1).replace('\\/', '/')
 
         return nonce, config_url
+
+    def _scan_html_for_odds(self, html: str):
+        """Check whether odds data is anywhere in the raw HTML."""
+        import re
+        hl = html.lower()
+
+        # 1. Look for bookmaker names
+        found_bm = None
+        for name in ["ggbet", "thunderpick", "1xbet", "vulkan", "roobet", "betify", "melbet"]:
+            if name in hl:
+                idx = hl.index(name)
+                found_bm = html[max(0, idx - 120):idx + 200]
+                print(f"[HLTV SCAN] Found bookmaker '{name}' — context: {found_bm[:300]}")
+                break
+        if not found_bm:
+            print("[HLTV SCAN] No bookmaker names found in HTML")
+
+        # 2. Look for decimal odds (1.xx or 2.xx or 3.xx)
+        odds_hits = re.findall(r'\b[123]\.\d{2}\b', html)
+        print(f"[HLTV SCAN] Decimal odds patterns in HTML: {len(odds_hits)} (sample: {odds_hits[:8]})")
+
+        # 3. Look for b-match-container or any bcb- classes
+        bcb_classes = re.findall(r'class="([^"]*bcb[^"]*)"', html)
+        bmc = "b-match-container" in html
+        print(f"[HLTV SCAN] b-match-container present: {bmc} | bcb-* classes: {bcb_classes[:5]}")
+
+        # 4. Look for team names that HLTV commonly shows
+        for team in ["faze", "navi", "g2", "vitality", "heroic", "spirit", "mouz"]:
+            if team in hl:
+                idx = hl.index(team)
+                print(f"[HLTV SCAN] Found team '{team}' at pos {idx}: {html[max(0,idx-80):idx+150]}")
+                break
+        else:
+            print("[HLTV SCAN] No known team names found in HTML")
 
     def _fetch_offers_data(self, config: dict) -> List[Dict]:
         """
