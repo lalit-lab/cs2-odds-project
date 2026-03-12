@@ -178,15 +178,11 @@ class OddsScraper:
         except Exception as e:
             print(f"[HLTV DIR] error: {e}")
 
-        # ── Strategy C: try WordPress REST API (bchltv/v1 namespace found!) ─
+        # ── Strategy C: bchltv/v1 REST endpoints ─────────────────────
         for path in [
-            "wp-json/bchltv/v1/",          # list all routes in the namespace
-            "wp-json/bchltv/v1/events",
-            "wp-json/bchltv/v1/offers",
-            "wp-json/bchltv/v1/odds",
-            "wp-json/bchltv/v1/matches",
-            "wp-json/bchltv/v1/sports",
-            "wp-json/bchltv/v1/data",
+            "wp-json/bchltv/v1/pages",     # only known route — get page list
+            "wp-json/bchltv/v1/pages/1",   # first page content
+            "wp-json/bchltv/v1/pages/2",
             "wp-json/",
         ]:
             try:
@@ -202,7 +198,32 @@ class OddsScraper:
             except Exception as e:
                 print(f"[HLTV REST] {path} error: {e}")
 
-        # ── Strategy D: try plausible timestamp-based filenames ───────
+        # ── Strategy D-extra: try admin-ajax as GET (POST returned 400) ─
+        nonce_val = self._extract_nonce(html) if 'html' in dir() else ""
+        for action in ["bcb_get_offers", "bcb_sync_offers", "bchltv_get_data",
+                       "bcb_get_sports_data", "bcb_load_data"]:
+            try:
+                r = self._session.get(
+                    f"https://bcwp.hltv.org/wp-admin/admin-ajax.php"
+                    f"?action={action}&security={nonce_val}&nonce={nonce_val}",
+                    timeout=8,
+                    headers={"Referer": "https://www.hltv.org/betting/money"},
+                )
+                print(f"[HLTV AJAX-GET] {action} → {r.status_code}: {r.text[:200]}")
+                if r.status_code == 200 and r.text.strip() not in ("0", "-1", ""):
+                    try:
+                        data = r.json()
+                        results = self._parse_data_json(data)
+                        if results:
+                            self._data_url_base = f"GET:{action}"
+                            print(f"[HLTV] AJAX GET action={action} worked!")
+                            return
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[HLTV AJAX-GET] {action} error: {e}")
+
+        # ── Strategy E: try plausible timestamp-based filenames ───────
         ts = 1773207330  # syncOffersData value
         for pattern in [
             f"http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data/{ts}.json",
