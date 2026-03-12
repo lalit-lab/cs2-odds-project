@@ -178,18 +178,22 @@ class OddsScraper:
         except Exception as e:
             print(f"[HLTV DIR] error: {e}")
 
-        # ── Strategy C: try WordPress REST API ────────────────────────
+        # ── Strategy C: try WordPress REST API (bchltv/v1 namespace found!) ─
         for path in [
-            "wp-json/bc-sports-blocks/v1/events",
-            "wp-json/bc-blocks/v1/offers",
-            "wp-json/bc-sports-blocks/v1/odds",
+            "wp-json/bchltv/v1/",          # list all routes in the namespace
+            "wp-json/bchltv/v1/events",
+            "wp-json/bchltv/v1/offers",
+            "wp-json/bchltv/v1/odds",
+            "wp-json/bchltv/v1/matches",
+            "wp-json/bchltv/v1/sports",
+            "wp-json/bchltv/v1/data",
             "wp-json/",
         ]:
             try:
                 r = self._session.get(
                     f"https://bcwp.hltv.org/{path}", timeout=8
                 )
-                print(f"[HLTV REST] {path} → {r.status_code}: {r.text[:300]}")
+                print(f"[HLTV REST] {path} → {r.status_code}: {r.text[:600]}")
                 if r.status_code == 200 and ('"offers"' in r.text or '"matches"' in r.text
                                               or '"events"' in r.text):
                     self._data_url_base = f"https://bcwp.hltv.org/{path}"
