@@ -118,9 +118,36 @@ class OddsScraper:
 
     def _parse_html(self, html: str) -> List[Dict]:
         from bs4 import BeautifulSoup
+        import re
 
         soup = BeautifulSoup(html, "html.parser")
         results = []
+
+        # Debug: show what's actually in the page
+        containers = soup.find_all("div", class_="b-match-container")
+        print(f"[HLTV DEBUG] b-match-container found: {len(containers)}")
+
+        # Check for embedded JSON data (common SPA pattern)
+        scripts = soup.find_all("script")
+        for s in scripts:
+            txt = s.get_text()
+            if "bookmaker" in txt.lower() or "betting" in txt.lower() or "odds" in txt.lower():
+                print(f"[HLTV DEBUG] Found script with odds/betting keywords (first 300 chars): {txt[:300]}")
+                break
+
+        # Check what top-level divs exist (to find correct container class)
+        main_div = soup.find("div", id="main-content") or soup.find("div", class_="contentCol")
+        if main_div:
+            child_classes = [
+                " ".join(c.get("class", [])) for c in main_div.children
+                if hasattr(c, "get") and c.get("class")
+            ]
+            print(f"[HLTV DEBUG] Main content children classes: {child_classes[:5]}")
+        else:
+            print("[HLTV DEBUG] No #main-content or .contentCol found")
+            # Print first few div classes to understand page structure
+            top_divs = [" ".join(d.get("class", [])) for d in soup.find_all("div", limit=20) if d.get("class")]
+            print(f"[HLTV DEBUG] First 20 div classes: {top_divs}")
 
         for mc in soup.find_all("div", class_="b-match-container"):
             table = mc.find("table", class_="bookmakerMatch")
