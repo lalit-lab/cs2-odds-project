@@ -349,6 +349,11 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    @keyframes flashUpdate {
+      0%   { box-shadow: 0 0 0 2px var(--green); background: rgba(63,185,80,0.18); }
+      100% { box-shadow: none; background: transparent; }
+    }
+    .match-card.updated { animation: flashUpdate 1.2s ease-out; }
 
     .mb-24 { margin-bottom: 24px; }
     .mt-24 { margin-top: 24px; }
@@ -498,6 +503,7 @@ const BOOKMAKER_URLS = {
 let ws = null;
 let currentUser = localStorage.getItem('cs2_user');
 let authToken   = localStorage.getItem('cs2_token');
+let prevOddsSnapshot = {};   // key: "teamA|||teamB|||source", value: {a, b}
 
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 function connectWS() {
@@ -566,14 +572,25 @@ function renderMatches(matchMap, allOdds) {
     return;
   }
 
-  container.innerHTML = Object.values(matchMap).map(match => {
+  const newSnapshot = {};
+  const html = Object.values(matchMap).map(match => {
     const bookmakers = [...new Set(match.entries.map(e => e.source))].sort();
     const oddsMapA = {}, oddsMapB = {};
-    match.entries.forEach(e => { oddsMapA[e.source] = e.team_a_odds; oddsMapB[e.source] = e.team_b_odds; });
+    match.entries.forEach(e => {
+      oddsMapA[e.source] = e.team_a_odds;
+      oddsMapB[e.source] = e.team_b_odds;
+      newSnapshot[`${match.team_a}|||${match.team_b}|||${e.source}`] = { a: e.team_a_odds, b: e.team_b_odds };
+    });
 
-    // Find best odds for highlighting
     const bestA = Math.max(...Object.values(oddsMapA).filter(v => v));
     const bestB = Math.max(...Object.values(oddsMapB).filter(v => v));
+
+    // Check if any value in this match changed vs previous snapshot
+    const matchChanged = match.entries.some(e => {
+      const key = `${match.team_a}|||${match.team_b}|||${e.source}`;
+      const prev = prevOddsSnapshot[key];
+      return !prev || prev.a !== e.team_a_odds || prev.b !== e.team_b_odds;
+    });
 
     const headerRow = `<tr>
       <th style="text-align:left;padding-left:16px">Team</th>
@@ -588,8 +605,12 @@ function renderMatches(matchMap, allOdds) {
       ${bookmakers.map(bm => {
         const v = oddsMapA[bm];
         if (!v) return `<td><span class="odd-value empty">—</span></td>`;
+        const key = `${match.team_a}|||${match.team_b}|||${bm}`;
+        const prev = prevOddsSnapshot[key];
+        const changed = prev && prev.a !== v;
         const cls = v === bestA ? 'best' : 'normal';
-        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}</span></td>`;
+        const arrow = changed ? (v > prev.a ? ' <span style="color:var(--green);font-size:0.65rem">▲</span>' : ' <span style="color:var(--red);font-size:0.65rem">▼</span>') : '';
+        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}${arrow}</span></td>`;
       }).join('')}
     </tr>`;
 
@@ -598,12 +619,16 @@ function renderMatches(matchMap, allOdds) {
       ${bookmakers.map(bm => {
         const v = oddsMapB[bm];
         if (!v) return `<td><span class="odd-value empty">—</span></td>`;
+        const key = `${match.team_a}|||${match.team_b}|||${bm}`;
+        const prev = prevOddsSnapshot[key];
+        const changed = prev && prev.b !== v;
         const cls = v === bestB ? 'best' : 'normal';
-        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}</span></td>`;
+        const arrow = changed ? (v > prev.b ? ' <span style="color:var(--green);font-size:0.65rem">▲</span>' : ' <span style="color:var(--red);font-size:0.65rem">▼</span>') : '';
+        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}${arrow}</span></td>`;
       }).join('')}
     </tr>`;
 
-    return `<div class="match-card">
+    return `<div class="match-card${matchChanged && Object.keys(prevOddsSnapshot).length ? ' updated' : ''}">
       <div class="match-header">
         <div class="match-title">${match.team_a} <span class="vs">vs</span> ${match.team_b}</div>
         <div class="match-meta">
@@ -619,6 +644,9 @@ function renderMatches(matchMap, allOdds) {
       </div>
     </div>`;
   }).join('');
+
+  container.innerHTML = html;
+  prevOddsSnapshot = newSnapshot;
 }
 
 // ── RENDER ARBITRAGE ──────────────────────────────────────────────────────────

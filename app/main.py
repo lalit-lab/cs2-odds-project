@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime, timedelta
 import asyncio
+import hashlib
+import json
 import os
 
 from app.database import get_db, init_db, User
@@ -265,33 +267,46 @@ async def scraper_status():
 async def scraping_loop():
     global live_odds_cache, arbitrage_cache, last_update, scraping_active
 
-    print("Scraping loop started")
+    # SCRAPE_INTERVAL env var controls update speed:
+    # - Local (HLTV): keep 18s (scrape itself takes ~15-20s)
+    # - Railway (mock): set SCRAPE_INTERVAL=5 in Railway env vars for near-live feel
+    interval = int(os.getenv("SCRAPE_INTERVAL", "18"))
+    last_hash = ""
+    print(f"Scraping loop started (interval={interval}s)")
 
     while scraping_active:
         try:
             print("Starting scrape cycle...")
             odds_data = await scraper.scrape_all_sites()
-            arbitrage_opps = analyzer.detect_arbitrage(odds_data)
 
-            live_odds_cache = odds_data
-            arbitrage_cache = arbitrage_opps
-            last_update = datetime.utcnow().isoformat()
+            # Change detection — only broadcast if odds actually changed
+            new_hash = hashlib.md5(
+                json.dumps(odds_data, sort_keys=True, default=str).encode()
+            ).hexdigest()
 
-            # Push update to all connected WebSocket clients
-            await manager.broadcast({
-                "type": "update",
-                "odds": odds_data,
-                "arbitrage": arbitrage_opps,
-                "timestamp": last_update,
-                "connections": len(manager.active_connections),
-            })
+            if new_hash != last_hash:
+                arbitrage_opps = analyzer.detect_arbitrage(odds_data)
+                live_odds_cache = odds_data
+                arbitrage_cache = arbitrage_opps
+                last_update = datetime.utcnow().isoformat()
+                last_hash = new_hash
 
-            print(f"Scraped {len(odds_data)} odds, {len(arbitrage_opps)} arbitrage opps — pushed to {len(manager.active_connections)} clients")
-            await asyncio.sleep(18)
+                await manager.broadcast({
+                    "type": "update",
+                    "odds": odds_data,
+                    "arbitrage": arbitrage_opps,
+                    "timestamp": last_update,
+                    "connections": len(manager.active_connections),
+                })
+                print(f"Odds changed — {len(odds_data)} entries, {len(arbitrage_opps)} arb opps, pushed to {len(manager.active_connections)} clients")
+            else:
+                print("No change in odds — skipping broadcast")
+
+            await asyncio.sleep(interval)
 
         except Exception as e:
             print(f"Scraping error: {e}")
-            await asyncio.sleep(18)
+            await asyncio.sleep(interval)
 
     print("Scraping loop stopped")
 
