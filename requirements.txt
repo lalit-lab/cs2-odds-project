@@ -3,8 +3,7 @@ uvicorn[standard]==0.27.0
 sqlalchemy==2.0.25
 psycopg2-binary==2.9.9
 redis==5.0.1
-playwright==1.40.0
-playwright-stealth==2.0.2
+curl_cffi==0.7.3
 beautifulsoup4==4.12.2
 requests==2.31.0
 python-telegram-bot==20.7

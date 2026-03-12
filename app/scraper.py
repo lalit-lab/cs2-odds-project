@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import re
 from typing import List, Dict
 from datetime import datetime
 from fuzzywuzzy import fuzz
@@ -30,29 +31,21 @@ BOOKMAKER_NAMES = {
 
 class OddsScraper:
     """
-    Scrapes real CS2 odds from HLTV.org using a PERSISTENT browser session.
+    Scrapes real CS2 odds from HLTV.org.
 
-    HLTV's betting page requires JavaScript execution (the odds widget is
-    rendered client-side). curl_cffi gets a 200 but the odds are not in
-    the raw HTML — we need a real browser.
-
-    Persistent browser strategy:
-      First load  : ~60-120s  (browser launch + Cloudflare JS challenge)
-      Subsequent  : ~5-10s   (page reload with cached CF cookies)
-
-    Uses a single-threaded executor so Playwright's sync API stays
-    thread-safe.
+    Strategy: curl_cffi bypasses Cloudflare for HLTV's main page (200 OK).
+    The odds widget JS files on bcwp.hltv.org are NOT behind Cloudflare,
+    so we can fetch them directly to discover the exact data file URLs.
     """
 
     def __init__(self):
+        self._session = None
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="hltv_browser"
+            max_workers=1, thread_name_prefix="hltv_http"
         )
-        self._browser = None
-        self._page = None
-        self._stealth_ctx = None
-        self._pw_ctx = None
-        self._initialized = False
+        # Cache the resolved data URL so we don't re-parse JS every cycle
+        self._data_url: str = ""
+        self._data_url_base: str = ""   # base path (without timestamp)
 
     # ──────────────────────────────────────────────────────────────────
     # PUBLIC ENTRY POINT
@@ -61,201 +54,216 @@ class OddsScraper:
     async def scrape_all_sites(self) -> List[Dict]:
         try:
             loop = asyncio.get_event_loop()
-            if not self._initialized:
-                print("[HLTV] Launching browser (first time — up to 2min on Railway)...")
-                timeout = 130.0
-            else:
-                print("[HLTV] Refreshing page (~5-10s)...")
-                timeout = 35.0
-
             data = await asyncio.wait_for(
-                loop.run_in_executor(
-                    self._executor,
-                    self._init_and_scrape if not self._initialized else self._refresh_and_scrape,
-                ),
-                timeout=timeout,
+                loop.run_in_executor(self._executor, self._fetch_and_parse),
+                timeout=45.0,
             )
-
             if data:
                 print(f"[HLTV] {len(data)} odds entries from "
                       f"{len(set(d['source'] for d in data))} bookmakers")
                 return self.normalize_team_names(data)
-
-            print("[HLTV] Page loaded but no odds parsed")
-
+            print("[HLTV] No odds this cycle")
         except asyncio.TimeoutError:
-            print(f"[HLTV] Timed out — resetting browser for next cycle")
-            self._executor.submit(self._reset_browser_sync)
+            print("[HLTV] Timeout — resetting session")
+            self._session = None
         except Exception as e:
             print(f"[HLTV] Error: {e}")
-            self._executor.submit(self._reset_browser_sync)
-
+            self._session = None
         return []
 
     # ──────────────────────────────────────────────────────────────────
-    # INIT  (runs once in executor thread)
+    # MAIN FETCH  (executor thread)
     # ──────────────────────────────────────────────────────────────────
 
-    def _init_and_scrape(self) -> List[Dict]:
-        from playwright.sync_api import sync_playwright
-        from playwright_stealth import Stealth
-        import time
-
-        self._stealth_ctx = Stealth().use_sync(sync_playwright())
-        self._pw_ctx = self._stealth_ctx.__enter__()
-
-        self._browser = self._pw_ctx.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--no-first-run",
-                "--memory-pressure-off",
-            ],
-        )
-        self._page = self._browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-        )
-
-        print("[HLTV] Browser ready — loading page (Cloudflare may take 30-60s)...")
-        self._page.goto(
-            "https://www.hltv.org/betting/money",
-            timeout=90000,          # 90s for the goto itself
-            wait_until="domcontentloaded",
-        )
-        print("[HLTV] DOM loaded — waiting for odds widget JS to render...")
-        time.sleep(10)              # give the betting widget JS time to run
-        self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(3)
-
-        self._initialized = True
-        print("[HLTV] Persistent browser ready")
-        return self._parse_page()
-
-    # ──────────────────────────────────────────────────────────────────
-    # REFRESH  (every subsequent call)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _refresh_and_scrape(self) -> List[Dict]:
-        import time
-        self._page.reload(timeout=20000, wait_until="domcontentloaded")
-        time.sleep(8)
-        self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
-        return self._parse_page()
-
-    # ──────────────────────────────────────────────────────────────────
-    # PAGE PARSER
-    # ──────────────────────────────────────────────────────────────────
-
-    def _parse_page(self) -> List[Dict]:
+    def _fetch_and_parse(self) -> List[Dict]:
+        from curl_cffi import requests as cffi_requests
         from bs4 import BeautifulSoup
 
-        html = self._page.content()
+        if self._session is None:
+            self._session = cffi_requests.Session(impersonate="chrome120")
+
+        # ── Step 1: get HLTV page (bypasses Cloudflare via TLS impersonation) ─
+        resp = self._session.get(
+            "https://www.hltv.org/betting/money",
+            timeout=20,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+            },
+        )
+        if resp.status_code != 200:
+            print(f"[HLTV] Main page HTTP {resp.status_code}")
+            self._session = None
+            return []
+
+        html = resp.text
+
+        # ── Step 2: extract bcwp nonce + configUrl ────────────────────
+        nonce = self._extract_nonce(html)
+
+        # ── Step 3: if we don't know the data URL yet, read the JS to find it ─
+        if not self._data_url_base:
+            self._discover_data_url(html)
+
+        if not self._data_url_base:
+            print("[HLTV] Could not discover data URL from JS — dumping script srcs")
+            soup = BeautifulSoup(html, "html.parser")
+            srcs = [s.get("src", "") for s in soup.find_all("script") if s.get("src")]
+            for s in srcs:
+                print(f"[HLTV]   script src: {s}")
+            return []
+
+        # ── Step 4: fetch the actual data JSON ────────────────────────
+        return self._fetch_data_json(nonce)
+
+    # ──────────────────────────────────────────────────────────────────
+    # DISCOVER DATA URL FROM JS
+    # ──────────────────────────────────────────────────────────────────
+
+    def _discover_data_url(self, html: str):
+        """
+        Find bcwp.hltv.org <script src="..."> tags, fetch each JS file,
+        search for the path pattern used to construct data URLs.
+        """
+        from bs4 import BeautifulSoup
+
         soup = BeautifulSoup(html, "html.parser")
+        bcwp_scripts = [
+            s["src"] for s in soup.find_all("script", src=True)
+            if "bcwp.hltv.org" in s.get("src", "") or "bc-blocks" in s.get("src", "")
+        ]
+        print(f"[HLTV] bcwp script tags found: {len(bcwp_scripts)}")
+        for src in bcwp_scripts[:5]:
+            print(f"[HLTV]   {src}")
+
+        for js_url in bcwp_scripts:
+            try:
+                r = self._session.get(js_url, timeout=10)
+                if r.status_code != 200:
+                    continue
+                js = r.text
+                print(f"[HLTV] JS file {js_url.split('/')[-1]} ({len(js)} chars)")
+
+                # Search for the data file path in the JS
+                hits = re.findall(
+                    r'(?:wp-content/uploads/bc-blocks-data/|bc-blocks-data/)[^\s\'"]+',
+                    js
+                )
+                if hits:
+                    print(f"[HLTV] Data path patterns in JS: {hits[:10]}")
+                    # Take the most relevant-looking one
+                    for h in hits:
+                        if "offers" in h.lower() or "data" in h.lower() or "sync" in h.lower():
+                            base = h.split("?")[0]  # strip query params
+                            self._data_url_base = f"https://bcwp.hltv.org/{base}"
+                            print(f"[HLTV] Using data URL base: {self._data_url_base}")
+                            return
+
+                # Also search for fetch/axios/XHR calls to bc-blocks or wp-admin
+                ajax_hits = re.findall(r'https?://bcwp\.hltv\.org[^\s\'"]+', js)
+                if ajax_hits:
+                    print(f"[HLTV] Direct bcwp URLs in JS: {ajax_hits[:10]}")
+
+                # Log a snippet near "syncOffersData" if found
+                if "syncOffersData" in js:
+                    idx = js.index("syncOffersData")
+                    print(f"[HLTV] syncOffersData context: {js[max(0,idx-150):idx+200]}")
+                if "offersData" in js or "offers" in js.lower():
+                    idx = js.lower().index("offers")
+                    print(f"[HLTV] 'offers' context: {js[max(0,idx-100):idx+200]}")
+
+            except Exception as e:
+                print(f"[HLTV] JS fetch error {js_url}: {e}")
+
+        # If no bcwp scripts, look for inline JS with path patterns
+        all_js = " ".join(s.get_text() for s in soup.find_all("script") if not s.get("src"))
+        hits = re.findall(r'bc-blocks-data/[^\s\'"\\]+', all_js)
+        if hits:
+            print(f"[HLTV] Inline JS path patterns: {hits[:10]}")
+            for h in hits:
+                if any(k in h.lower() for k in ["offers", "data", "sync"]):
+                    self._data_url_base = f"https://bcwp.hltv.org/wp-content/uploads/{h.split('?')[0]}"
+                    print(f"[HLTV] Using data URL base from inline JS: {self._data_url_base}")
+                    return
+
+    def _extract_nonce(self, html: str) -> str:
+        m = re.search(r'"bcb_security"\s*:\s*"([^"]+)"', html)
+        return m.group(1) if m else ""
+
+    # ──────────────────────────────────────────────────────────────────
+    # FETCH AND PARSE THE DATA JSON
+    # ──────────────────────────────────────────────────────────────────
+
+    def _fetch_data_json(self, nonce: str) -> List[Dict]:
+        """Fetch the data JSON from the discovered URL and parse odds."""
+        url = self._data_url_base
+        print(f"[HLTV] Fetching data: {url}")
+        try:
+            r = self._session.get(url, timeout=15)
+            print(f"[HLTV] Data → HTTP {r.status_code}, {len(r.text)} chars: {r.text[:500]}")
+            if r.status_code == 200 and r.text.strip():
+                data = r.json()
+                results = self._parse_data_json(data)
+                if results:
+                    return results
+                # If parse failed, clear cache so we re-discover next cycle
+                print("[HLTV] JSON parse returned no results — clearing URL cache")
+                self._data_url_base = ""
+        except Exception as e:
+            print(f"[HLTV] Data fetch error: {e}")
+            self._data_url_base = ""
+        return []
+
+    def _parse_data_json(self, data) -> List[Dict]:
         results = []
+        if isinstance(data, dict):
+            items = (data.get("offers") or data.get("matches") or
+                     data.get("events") or data.get("data") or
+                     data.get("items") or list(data.values()))
+        elif isinstance(data, list):
+            items = data
+        else:
+            print(f"[HLTV] Unexpected JSON type: {type(data)}")
+            return []
 
-        # Debug: how many containers found
-        containers = soup.find_all("div", class_="b-match-container")
-        print(f"[HLTV] b-match-container count: {len(containers)}")
-        if not containers:
-            # Log a snippet so we can see what we actually got
-            title = soup.title.get_text() if soup.title else "no title"
-            print(f"[HLTV] Page title: {title!r}")
+        if items and isinstance(items[0] if items else None, dict):
+            print(f"[HLTV] JSON items: {len(items)}, first keys: {list(items[0].keys())[:8]}")
 
-        for mc in containers:
-            table = mc.find("table", class_="bookmakerMatch")
-            if not table:
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            rows = table.find_all("tr", class_="teamrow")
-            if len(rows) != 2:
-                continue
-
-            def _team(row):
-                box = row.find("td", class_="bookmakerTeamBox")
-                if not box:
-                    return None
-                img = box.find("img")
-                if img and img.get("alt"):
-                    return img["alt"].strip()
-                a = box.find("a")
-                return a.get_text(strip=True) if a else None
-
-            team_a, team_b = _team(rows[0]), _team(rows[1])
+            team_a = (item.get("team1") or item.get("home_team") or
+                      item.get("teamA") or item.get("team1_name") or "")
+            team_b = (item.get("team2") or item.get("away_team") or
+                      item.get("teamB") or item.get("team2_name") or "")
             if not team_a or not team_b:
                 continue
-
-            for ca, cb in zip(
-                rows[0].find_all("td", class_="odds"),
-                rows[1].find_all("td", class_="odds"),
-            ):
-                bm_key = next(
-                    (
-                        c.replace("b-list-odds-provider-", "")
-                        for c in ca.get("class", [])
-                        if c.startswith("b-list-odds-provider-")
-                    ),
-                    None,
-                )
-                if not bm_key:
+            for bm in (item.get("bookmakers") or item.get("odds") or
+                       item.get("operators") or []):
+                if not isinstance(bm, dict):
                     continue
-
-                bm_name = BOOKMAKER_NAMES.get(bm_key.lower(), bm_key.title())
-                tag_a, tag_b = ca.find("a"), cb.find("a")
-                if not tag_a or not tag_b:
-                    continue
-
+                bm_name = (bm.get("name") or bm.get("bookmaker") or
+                           bm.get("operator") or "")
                 try:
-                    odds_a = round(float(tag_a.get_text(strip=True)), 2)
-                    odds_b = round(float(tag_b.get_text(strip=True)), 2)
-                except ValueError:
+                    odds_a = round(float(
+                        bm.get("odds1") or bm.get("home") or bm.get("team1") or
+                        bm.get("odd1") or bm.get("win1") or 0), 2)
+                    odds_b = round(float(
+                        bm.get("odds2") or bm.get("away") or bm.get("team2") or
+                        bm.get("odd2") or bm.get("win2") or 0), 2)
+                except (ValueError, TypeError):
                     continue
-
-                results.append({
-                    "source": bm_name,
-                    "team_a": team_a,
-                    "team_b": team_b,
-                    "team_a_odds": odds_a,
-                    "team_b_odds": odds_b,
-                    "match_time": datetime.utcnow().isoformat(),
-                })
-
+                if odds_a > 1.0 and odds_b > 1.0:
+                    results.append({
+                        "source": bm_name,
+                        "team_a": str(team_a),
+                        "team_b": str(team_b),
+                        "team_a_odds": odds_a,
+                        "team_b_odds": odds_b,
+                        "match_time": datetime.utcnow().isoformat(),
+                    })
         return results
-
-    # ──────────────────────────────────────────────────────────────────
-    # BROWSER RESET
-    # ──────────────────────────────────────────────────────────────────
-
-    def _reset_browser_sync(self):
-        self._initialized = False
-        for obj, method in [
-            (self._browser, "close"),
-            (self._stealth_ctx, "__exit__"),
-        ]:
-            try:
-                if obj:
-                    if method == "__exit__":
-                        obj.__exit__(None, None, None)
-                    else:
-                        getattr(obj, method)()
-            except Exception:
-                pass
-        self._browser = None
-        self._page = None
-        self._pw_ctx = None
-        self._stealth_ctx = None
-        print("[HLTV] Browser reset — will re-init on next cycle")
 
     # ──────────────────────────────────────────────────────────────────
     # TEAM NAME NORMALIZER
