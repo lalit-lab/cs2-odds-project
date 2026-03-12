@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CS2 Live Odds | Real-time Betting Aggregator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface2:  #21262d;
+      --border:    #30363d;
+      --accent:    #ff6b35;
+      --accent2:   #e85d24;
+      --text:      #e6edf3;
+      --muted:     #8b949e;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --red:       #f85149;
+      --blue:      #58a6ff;
+      --radius:    8px;
+    }
+
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+
+    /* ── NAV ─────────────────────────────────────────── */
+    nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .nav-logo {
+      font-size: 1.3rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.5px;
+    }
+    .nav-logo span { color: var(--text); }
+    .nav-center { display: flex; align-items: center; gap: 12px; }
+    .live-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(63,185,80,0.12);
+      border: 1px solid var(--green);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--green);
+    }
+    .live-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 1.5s infinite;
+    }
+    .ws-status {
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .ws-status.connected { color: var(--green); }
+    .ws-status.disconnected { color: var(--red); }
+    .nav-right { display: flex; align-items: center; gap: 10px; }
+    .btn {
+      padding: 7px 16px;
+      border-radius: var(--radius);
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s;
+    }
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent2); }
+    .btn-sm { padding: 5px 12px; font-size: 0.78rem; }
+    .user-chip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 5px 14px;
+      font-size: 0.82rem;
+    }
+    .user-chip .avatar {
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.7rem; font-weight: 700; color: #fff;
+    }
+    #logoutBtn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.78rem; }
+    #logoutBtn:hover { color: var(--red); }
+
+    /* ── STATS BAR ────────────────────────────────────── */
+    .stats-bar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      gap: 32px;
+      overflow-x: auto;
+    }
+    .stat { display: flex; flex-direction: column; gap: 2px; min-width: max-content; }
+    .stat-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-value { font-size: 1.1rem; font-weight: 700; color: var(--text); }
+    .stat-value.green { color: var(--green); }
+    .stat-value.orange { color: var(--accent); }
+    .stat-value.blue { color: var(--blue); }
+    #lastUpdate { font-size: 0.72rem; color: var(--muted); }
+
+    /* ── MAIN CONTENT ─────────────────────────────────── */
+    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+    .section-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .section-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    .count-badge {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1px 8px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    /* ── MATCH CARD ───────────────────────────────────── */
+    .match-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .match-header {
+      background: var(--surface2);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+    }
+    .match-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+    .match-title .vs { color: var(--muted); margin: 0 8px; font-weight: 400; }
+    .match-meta { font-size: 0.75rem; color: var(--muted); display: flex; gap: 12px; }
+    .tag {
+      background: rgba(255,107,53,0.15);
+      color: var(--accent);
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 0.68rem;
+      font-weight: 700;
+    }
+
+    /* odds table inside each card */
+    .odds-table-wrapper { overflow-x: auto; }
+    .odds-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.83rem;
+    }
+    .odds-table th {
+      padding: 8px 14px;
+      text-align: center;
+      font-weight: 600;
+      color: var(--muted);
+      font-size: 0.72rem;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .odds-table th a {
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    .odds-table th a:hover { color: var(--accent); }
+    .odds-table td {
+      padding: 10px 14px;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .odds-table tr:last-child td { border-bottom: none; }
+    .team-cell {
+      text-align: left !important;
+      font-weight: 600;
+      white-space: nowrap;
+      padding-left: 16px !important;
+      min-width: 130px;
+    }
+    .odd-value {
+      font-weight: 700;
+      font-size: 0.9rem;
+      padding: 4px 8px;
+      border-radius: 5px;
+      display: inline-block;
+      min-width: 44px;
+    }
+    .odd-value.best {
+      background: rgba(63,185,80,0.15);
+      color: var(--green);
+      border: 1px solid rgba(63,185,80,0.3);
+    }
+    .odd-value.normal { color: var(--text); }
+    .odd-value.empty { color: var(--border); }
+
+    /* ── ARBITRAGE SECTION ────────────────────────────── */
+    .arb-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .arb-table th {
+      padding: 10px 16px;
+      background: var(--surface2);
+      text-align: left;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+    }
+    .arb-table td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+    .arb-table tr:last-child td { border-bottom: none; }
+    .arb-table tr:hover td { background: var(--surface2); }
+    .profit-badge {
+      background: rgba(63,185,80,0.15);
+      color: var(--green);
+      border: 1px solid rgba(63,185,80,0.3);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-weight: 700;
+      font-size: 0.9rem;
+    }
+    .arb-source { font-size: 0.75rem; color: var(--muted); }
+    .arb-source a { color: var(--blue); text-decoration: none; }
+    .arb-source a:hover { text-decoration: underline; }
+    .no-data {
+      text-align: center;
+      padding: 40px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    /* ── MODAL ────────────────────────────────────────── */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px 32px;
+      width: 100%;
+      max-width: 400px;
+      position: relative;
+    }
+    .modal h2 { font-size: 1.2rem; margin-bottom: 6px; }
+    .modal p { font-size: 0.82rem; color: var(--muted); margin-bottom: 22px; }
+    .modal-close {
+      position: absolute; top: 14px; right: 16px;
+      background: none; border: none; color: var(--muted);
+      font-size: 1.3rem; cursor: pointer; line-height: 1;
+    }
+    .modal-close:hover { color: var(--text); }
+    .tabs { display: flex; gap: 0; margin-bottom: 22px; border-bottom: 1px solid var(--border); }
+    .tab {
+      padding: 8px 18px;
+      cursor: pointer;
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: all 0.15s;
+    }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
+    .form-group input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 9px 12px;
+      color: var(--text);
+      font-size: 0.88rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .form-group input:focus { border-color: var(--accent); }
+    .form-error { font-size: 0.78rem; color: var(--red); margin-top: 4px; }
+    .form-success { font-size: 0.78rem; color: var(--green); margin-top: 4px; }
+    #authMsg { min-height: 18px; font-size: 0.8rem; margin-bottom: 8px; }
+
+    /* ── LOADING ──────────────────────────────────────── */
+    .loading {
+      text-align: center;
+      padding: 60px;
+      color: var(--muted);
+    }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    .mb-24 { margin-bottom: 24px; }
+    .mt-24 { margin-top: 24px; }
+  </style>
+</head>
+<body>
+
+<!-- NAVBAR -->
+<nav>
+  <div class="nav-logo">CS2<span>Odds</span></div>
+  <div class="nav-center">
+    <div class="live-badge"><div class="live-dot"></div>LIVE</div>
+    <div class="ws-status disconnected" id="wsStatus">Connecting...</div>
+  </div>
+  <div class="nav-right" id="navRight">
+    <button class="btn btn-outline btn-sm" onclick="openModal('login')">Login</button>
+    <button class="btn btn-primary btn-sm" onclick="openModal('register')">Register</button>
+  </div>
+</nav>
+
+<!-- STATS BAR -->
+<div class="stats-bar">
+  <div class="stat">
+    <span class="stat-label">Live Matches</span>
+    <span class="stat-value orange" id="statMatches">—</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Arbitrage Opps</span>
+    <span class="stat-value green" id="statArb">—</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Bookmakers</span>
+    <span class="stat-value blue" id="statBooks">—</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Odds Tracked</span>
+    <span class="stat-value" id="statOdds">—</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Connected Users</span>
+    <span class="stat-value" id="statUsers">—</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Last Updated</span>
+    <span id="lastUpdate" class="stat-value" style="font-size:0.8rem;color:var(--muted)">—</span>
+  </div>
+</div>
+
+<!-- MAIN CONTENT -->
+<div class="container">
+
+  <!-- MATCHES -->
+  <div class="mb-24">
+    <div class="section-title">
+      Live CS2 Matches
+      <span class="count-badge" id="matchCountBadge">0</span>
+    </div>
+    <div id="matchesContainer">
+      <div class="loading">
+        <div class="spinner"></div>
+        Connecting to live data feed...
+      </div>
+    </div>
+  </div>
+
+  <!-- ARBITRAGE -->
+  <div class="mt-24">
+    <div class="section-title">
+      Arbitrage Opportunities
+      <span class="count-badge" id="arbCountBadge">0</span>
+    </div>
+    <div id="arbContainer">
+      <div class="no-data">No arbitrage opportunities found yet...</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- LOGIN / REGISTER MODAL -->
+<div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">&#x2715;</button>
+    <h2>Welcome to CS2Odds</h2>
+    <p>Track live odds and arbitrage opportunities</p>
+    <div class="tabs">
+      <div class="tab active" id="tabLogin" onclick="switchTab('login')">Login</div>
+      <div class="tab" id="tabRegister" onclick="switchTab('register')">Register</div>
+    </div>
+
+    <!-- LOGIN FORM -->
+    <div id="formLogin">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="loginUser" placeholder="Enter username" />
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="loginPass" placeholder="Enter password" />
+      </div>
+      <div id="authMsg"></div>
+      <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login</button>
+    </div>
+
+    <!-- REGISTER FORM -->
+    <div id="formRegister" style="display:none">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="regUser" placeholder="Choose a username" />
+      </div>
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="regEmail" placeholder="your@email.com" />
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="regPass" placeholder="Choose a password" />
+      </div>
+      <div id="authMsg2"></div>
+      <button class="btn btn-primary" style="width:100%" onclick="doRegister()">Create Account</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+const BOOKMAKER_URLS = {
+  "GGBet":       "https://ggbet.com",
+  "Thunderpick": "https://thunderpick.io",
+  "1xBet":       "https://1xbet.com",
+  "Vulkan Bet":  "https://vulkanbet.com",
+  "Bet20":       "https://bet20.com",
+  "N1 Bet":      "https://n1bet.com",
+  "Roobet":      "https://roobet.com",
+  "Betify":      "https://betify.com",
+  "Melbet":      "https://melbet.com",
+  "BC.Game":     "https://bc.game",
+  "EpicBet":     "https://epicbet.com",
+  "Vavada":      "https://vavada.com",
+  "Housebets":   "https://housebets.com",
+  "ColdBet":     "https://coldbet.com",
+  "BetLabel":    "https://betlabel.com",
+  "YBets":       "https://ybets.com",
+  "2UP":         "https://2up.io",
+};
+
+// ── STATE ─────────────────────────────────────────────────────────────────────
+let ws = null;
+let currentUser = localStorage.getItem('cs2_user');
+let authToken   = localStorage.getItem('cs2_token');
+
+// ── WEBSOCKET ─────────────────────────────────────────────────────────────────
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    document.getElementById('wsStatus').textContent = 'Connected';
+    document.getElementById('wsStatus').className = 'ws-status connected';
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'update') {
+      renderAll(msg.odds, msg.arbitrage, msg.timestamp, msg.connections);
+    }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('wsStatus').textContent = 'Reconnecting...';
+    document.getElementById('wsStatus').className = 'ws-status disconnected';
+    setTimeout(connectWS, 3000); // auto-reconnect
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ── RENDER ALL ────────────────────────────────────────────────────────────────
+function renderAll(odds, arbitrage, timestamp, connections) {
+  // Stats
+  const matchMap = groupByMatch(odds);
+  const uniqueBooks = new Set(odds.map(o => o.source));
+  document.getElementById('statMatches').textContent  = Object.keys(matchMap).length;
+  document.getElementById('statArb').textContent      = arbitrage.length;
+  document.getElementById('statBooks').textContent    = uniqueBooks.size;
+  document.getElementById('statOdds').textContent     = odds.length;
+  document.getElementById('statUsers').textContent    = connections ?? '—';
+  document.getElementById('matchCountBadge').textContent = Object.keys(matchMap).length;
+  document.getElementById('arbCountBadge').textContent   = arbitrage.length;
+
+  if (timestamp) {
+    const d = new Date(timestamp + 'Z');
+    document.getElementById('lastUpdate').textContent = d.toLocaleTimeString();
+  }
+
+  renderMatches(matchMap, odds);
+  renderArbitrage(arbitrage);
+}
+
+// ── GROUP ODDS BY MATCH ───────────────────────────────────────────────────────
+function groupByMatch(odds) {
+  const map = {};
+  odds.forEach(o => {
+    const key = `${o.team_a}|||${o.team_b}`;
+    if (!map[key]) map[key] = { team_a: o.team_a, team_b: o.team_b, entries: [] };
+    map[key].entries.push(o);
+  });
+  return map;
+}
+
+// ── RENDER MATCHES ────────────────────────────────────────────────────────────
+function renderMatches(matchMap, allOdds) {
+  const container = document.getElementById('matchesContainer');
+  if (!Object.keys(matchMap).length) {
+    container.innerHTML = '<div class="no-data">No live matches found.</div>';
+    return;
+  }
+
+  container.innerHTML = Object.values(matchMap).map(match => {
+    const bookmakers = [...new Set(match.entries.map(e => e.source))].sort();
+    const oddsMapA = {}, oddsMapB = {};
+    match.entries.forEach(e => { oddsMapA[e.source] = e.team_a_odds; oddsMapB[e.source] = e.team_b_odds; });
+
+    // Find best odds for highlighting
+    const bestA = Math.max(...Object.values(oddsMapA).filter(v => v));
+    const bestB = Math.max(...Object.values(oddsMapB).filter(v => v));
+
+    const headerRow = `<tr>
+      <th style="text-align:left;padding-left:16px">Team</th>
+      ${bookmakers.map(bm => {
+        const url = BOOKMAKER_URLS[bm];
+        return `<th>${url ? `<a href="${url}" target="_blank" rel="noopener">${bm}</a>` : bm}</th>`;
+      }).join('')}
+    </tr>`;
+
+    const rowA = `<tr>
+      <td class="team-cell">${match.team_a}</td>
+      ${bookmakers.map(bm => {
+        const v = oddsMapA[bm];
+        if (!v) return `<td><span class="odd-value empty">—</span></td>`;
+        const cls = v === bestA ? 'best' : 'normal';
+        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}</span></td>`;
+      }).join('')}
+    </tr>`;
+
+    const rowB = `<tr>
+      <td class="team-cell">${match.team_b}</td>
+      ${bookmakers.map(bm => {
+        const v = oddsMapB[bm];
+        if (!v) return `<td><span class="odd-value empty">—</span></td>`;
+        const cls = v === bestB ? 'best' : 'normal';
+        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}</span></td>`;
+      }).join('')}
+    </tr>`;
+
+    return `<div class="match-card">
+      <div class="match-header">
+        <div class="match-title">${match.team_a} <span class="vs">vs</span> ${match.team_b}</div>
+        <div class="match-meta">
+          <span class="tag">CS2</span>
+          <span>${bookmakers.length} bookmakers</span>
+        </div>
+      </div>
+      <div class="odds-table-wrapper">
+        <table class="odds-table">
+          <thead>${headerRow}</thead>
+          <tbody>${rowA}${rowB}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── RENDER ARBITRAGE ──────────────────────────────────────────────────────────
+function renderArbitrage(arbs) {
+  const container = document.getElementById('arbContainer');
+  if (!arbs.length) {
+    container.innerHTML = '<div class="no-data">No arbitrage opportunities found.</div>';
+    return;
+  }
+  container.innerHTML = `<table class="arb-table">
+    <thead><tr>
+      <th>Match</th>
+      <th>Profit</th>
+      <th>Team A Best Odds</th>
+      <th>Team B Best Odds</th>
+      <th>Stake Split</th>
+    </tr></thead>
+    <tbody>
+      ${arbs.map(a => {
+        const urlA = BOOKMAKER_URLS[a.source_a] || '#';
+        const urlB = BOOKMAKER_URLS[a.source_b] || '#';
+        return `<tr>
+          <td><strong>${a.team_a}</strong> vs ${a.team_b}</td>
+          <td><span class="profit-badge">+${a.profit_percent}%</span></td>
+          <td>
+            <strong>${a.best_odds_a}</strong>
+            <div class="arb-source">via <a href="${urlA}" target="_blank" rel="noopener">${a.source_a}</a></div>
+          </td>
+          <td>
+            <strong>${a.best_odds_b}</strong>
+            <div class="arb-source">via <a href="${urlB}" target="_blank" rel="noopener">${a.source_b}</a></div>
+          </td>
+          <td>${a.stake_a_percent}% / ${a.stake_b_percent}%</td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
+}
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
+function openModal(tab) {
+  document.getElementById('modalOverlay').classList.add('open');
+  switchTab(tab);
+}
+function closeModal() {
+  document.getElementById('modalOverlay').classList.remove('open');
+}
+function switchTab(tab) {
+  document.getElementById('tabLogin').classList.toggle('active', tab === 'login');
+  document.getElementById('tabRegister').classList.toggle('active', tab === 'register');
+  document.getElementById('formLogin').style.display    = tab === 'login'    ? 'block' : 'none';
+  document.getElementById('formRegister').style.display = tab === 'register' ? 'block' : 'none';
+  document.getElementById('authMsg').textContent = '';
+  document.getElementById('authMsg2').textContent = '';
+}
+
+async function doLogin() {
+  const user = document.getElementById('loginUser').value.trim();
+  const pass = document.getElementById('loginPass').value;
+  const msg  = document.getElementById('authMsg');
+  if (!user || !pass) { msg.className='form-error'; msg.textContent='Fill all fields'; return; }
+  try {
+    const body = new URLSearchParams({ username: user, password: pass });
+    const res  = await fetch('/api/auth/login', { method: 'POST', body });
+    const data = await res.json();
+    if (!res.ok) { msg.className='form-error'; msg.textContent=data.detail||'Login failed'; return; }
+    authToken = data.access_token;
+    currentUser = user;
+    localStorage.setItem('cs2_token', authToken);
+    localStorage.setItem('cs2_user', user);
+    updateNavUser();
+    closeModal();
+  } catch(e) { msg.className='form-error'; msg.textContent='Network error'; }
+}
+
+async function doRegister() {
+  const user  = document.getElementById('regUser').value.trim();
+  const email = document.getElementById('regEmail').value.trim();
+  const pass  = document.getElementById('regPass').value;
+  const msg   = document.getElementById('authMsg2');
+  if (!user || !email || !pass) { msg.className='form-error'; msg.textContent='Fill all fields'; return; }
+  try {
+    const res  = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, email, password: pass })
+    });
+    const data = await res.json();
+    if (!res.ok) { msg.className='form-error'; msg.textContent=data.detail||'Registration failed'; return; }
+    msg.className='form-success'; msg.textContent='Account created! Logging you in...';
+    setTimeout(() => { switchTab('login'); document.getElementById('loginUser').value=user; }, 1000);
+  } catch(e) { msg.className='form-error'; msg.textContent='Network error'; }
+}
+
+function doLogout() {
+  authToken = null; currentUser = null;
+  localStorage.removeItem('cs2_token');
+  localStorage.removeItem('cs2_user');
+  updateNavUser();
+}
+
+function updateNavUser() {
+  const nav = document.getElementById('navRight');
+  if (currentUser) {
+    nav.innerHTML = `
+      <div class="user-chip">
+        <div class="avatar">${currentUser[0].toUpperCase()}</div>
+        ${currentUser}
+        <button id="logoutBtn" onclick="doLogout()">Logout</button>
+      </div>`;
+  } else {
+    nav.innerHTML = `
+      <button class="btn btn-outline btn-sm" onclick="openModal('login')">Login</button>
+      <button class="btn btn-primary btn-sm" onclick="openModal('register')">Register</button>`;
+  }
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+updateNavUser();
+connectWS();
+</script>
+</body>
+</html>
