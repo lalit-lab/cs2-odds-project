@@ -271,7 +271,7 @@ async def scraping_loop():
     # SCRAPE_INTERVAL env var controls update speed:
     # - Local (HLTV): keep 18s (scrape itself takes ~15-20s)
     # - Railway (mock): set SCRAPE_INTERVAL=5 in Railway env vars for near-live feel
-    interval = int(os.getenv("SCRAPE_INTERVAL", "6"))
+    interval = int(os.getenv("SCRAPE_INTERVAL", "12"))
     last_hash = ""
     print(f"Scraping loop started (interval={interval}s)")
 
