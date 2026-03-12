@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures
-import os
 from typing import List, Dict
 from datetime import datetime
 from fuzzywuzzy import fuzz
@@ -31,162 +30,96 @@ BOOKMAKER_NAMES = {
 
 class OddsScraper:
     """
-    Scrapes real CS2 odds from HLTV.org using a PERSISTENT browser session.
+    Scrapes real CS2 odds from HLTV.org using curl_cffi to bypass
+    Cloudflare without needing a full browser.
 
-    First load  : ~15-20s  (launches browser + Cloudflare bypass)
-    Subsequent  : ~4-6s    (just reloads the already-open page)
+    curl_cffi mimics Chrome's exact TLS fingerprint — works on datacenter
+    IPs (Railway, etc.) where headless Playwright gets blocked.
 
-    Also intercepts HLTV's own WebSocket connections — if HLTV pushes
-    real-time updates via WS, those frames are captured and logged.
-    In a future iteration, we can connect directly to that WS endpoint
-    without needing the browser at all.
+    Keeps a persistent session so Cloudflare cookies are reused across
+    scrape cycles (~1-2s per cycle after the first request).
 
     No mock data — returns [] if scraping fails so the UI shows an honest
     "no data" state rather than fake numbers.
     """
 
     def __init__(self):
-        # Single-threaded executor keeps the browser in ONE thread (Playwright sync is not thread-safe)
+        self._session = None
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="hltv_browser"
+            max_workers=1, thread_name_prefix="hltv_http"
         )
-        self._browser = None
-        self._page = None
-        self._stealth_ctx = None
-        self._pw_ctx = None
-        self._initialized = False
-        self._ws_urls: List[str] = []
-        self._ws_frames: List[str] = []
 
     # ──────────────────────────────────────────────────────────────────
     # PUBLIC ENTRY POINT
     # ──────────────────────────────────────────────────────────────────
 
     async def scrape_all_sites(self) -> List[Dict]:
-        """
-        Real HLTV data only.
-        First call: launches browser (~20s). Every call after: page refresh (~5s).
-        """
+        """Real HLTV data only. Uses curl_cffi to bypass Cloudflare."""
         try:
             loop = asyncio.get_event_loop()
-            if not self._initialized:
-                print("[HLTV] Launching persistent browser (first time ~20s)...")
-                data = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._init_and_scrape),
-                    timeout=55.0,
-                )
-            else:
-                print("[HLTV] Refreshing page (persistent session ~5s)...")
-                data = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._refresh_and_scrape),
-                    timeout=25.0,
-                )
+            data = await asyncio.wait_for(
+                loop.run_in_executor(self._executor, self._fetch_and_parse),
+                timeout=30.0,
+            )
 
             if data:
                 print(f"[HLTV] {len(data)} odds entries from "
                       f"{len(set(d['source'] for d in data))} bookmakers")
                 return self.normalize_team_names(data)
 
-            print("[HLTV] Page loaded but no odds parsed yet")
+            print("[HLTV] Page fetched but no odds parsed")
 
         except asyncio.TimeoutError:
-            print("[HLTV] Timed out — resetting browser for next cycle")
-            self._executor.submit(self._reset_browser_sync)
+            print("[HLTV] Request timed out — will retry next cycle")
+            self._session = None  # reset session so next attempt gets fresh cookies
         except Exception as e:
-            print(f"[HLTV] Error: {e} — resetting browser")
-            self._executor.submit(self._reset_browser_sync)
+            print(f"[HLTV] Error: {e} — will retry next cycle")
+            self._session = None
 
-        return []   # real empty — no mock
+        return []  # real empty — no mock
 
     # ──────────────────────────────────────────────────────────────────
-    # INIT  (runs in executor thread, ONCE)
+    # HTTP FETCH  (runs in executor thread)
     # ──────────────────────────────────────────────────────────────────
 
-    def _init_and_scrape(self) -> List[Dict]:
-        from playwright.sync_api import sync_playwright
-        from playwright_stealth import Stealth
-        import time
+    def _fetch_and_parse(self) -> List[Dict]:
+        from curl_cffi import requests as cffi_requests
 
-        # Keep Stealth context alive (holds playwright process)
-        self._stealth_ctx = Stealth().use_sync(sync_playwright())
-        self._pw_ctx = self._stealth_ctx.__enter__()
+        if self._session is None:
+            self._session = cffi_requests.Session(impersonate="chrome120")
+            print("[HLTV] New curl_cffi session created")
 
-        self._browser = self._pw_ctx.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        resp = self._session.get(
+            "https://www.hltv.org/betting/money",
+            timeout=20,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+            },
         )
-        self._page = self._browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-        )
 
-        # ── WebSocket interception ──────────────────────────────────────
-        # If HLTV pushes odds updates via WebSocket, we capture them here.
-        # Logged frames tell us the message format; with that we could
-        # connect directly via aiohttp WebSocket (no browser needed at all).
-        def _on_ws(ws):
-            print(f"[HLTV WS] Detected: {ws.url}")
-            self._ws_urls.append(ws.url)
-            ws.on(
-                "framereceived",
-                lambda payload: self._ws_frames.append(
-                    str(payload.get("payload", ""))[:500]
-                ),
-            )
+        if resp.status_code != 200:
+            print(f"[HLTV] HTTP {resp.status_code} — Cloudflare may have blocked request")
+            self._session = None
+            return []
 
-        self._page.on("websocket", _on_ws)
-        # ───────────────────────────────────────────────────────────────
-
-        self._page.goto("https://www.hltv.org/betting/money", timeout=30000)
-        time.sleep(5)
-        self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
-        self._initialized = True
-        print("[HLTV] Persistent browser ready")
-
-        # Log any WebSocket findings
-        if self._ws_urls:
-            print(f"[HLTV WS] {len(self._ws_urls)} WebSocket(s) found: {self._ws_urls}")
-        if self._ws_frames:
-            print(f"[HLTV WS] Sample frame: {self._ws_frames[0]}")
-
-        return self._parse_page()
+        print(f"[HLTV] HTTP {resp.status_code} — parsing HTML ({len(resp.text)} chars)")
+        return self._parse_html(resp.text)
 
     # ──────────────────────────────────────────────────────────────────
-    # REFRESH  (runs in executor thread, every subsequent call)
+    # HTML PARSER
     # ──────────────────────────────────────────────────────────────────
 
-    def _refresh_and_scrape(self) -> List[Dict]:
-        import time
-
-        # Clear WS frames for this cycle
-        self._ws_frames = []
-
-        # Reload page — Cloudflare cookies already set → fast (~3-5s)
-        self._page.reload(timeout=15000, wait_until="domcontentloaded")
-        time.sleep(3)
-        self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1)
-
-        if self._ws_frames:
-            print(f"[HLTV WS] {len(self._ws_frames)} frames this cycle — "
-                  f"sample: {self._ws_frames[0][:150]}")
-
-        return self._parse_page()
-
-    # ──────────────────────────────────────────────────────────────────
-    # PAGE PARSER
-    # ──────────────────────────────────────────────────────────────────
-
-    def _parse_page(self) -> List[Dict]:
+    def _parse_html(self, html: str) -> List[Dict]:
         from bs4 import BeautifulSoup
 
-        soup = BeautifulSoup(self._page.content(), "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         results = []
 
         for mc in soup.find_all("div", class_="b-match-container"):
@@ -247,30 +180,6 @@ class OddsScraper:
                 })
 
         return results
-
-    # ──────────────────────────────────────────────────────────────────
-    # BROWSER RESET
-    # ──────────────────────────────────────────────────────────────────
-
-    def _reset_browser_sync(self):
-        self._initialized = False
-        for obj, method in [
-            (self._browser, "close"),
-            (self._stealth_ctx, "__exit__"),
-        ]:
-            try:
-                if obj:
-                    if method == "__exit__":
-                        obj.__exit__(None, None, None)
-                    else:
-                        getattr(obj, method)()
-            except Exception:
-                pass
-        self._browser = None
-        self._page = None
-        self._pw_ctx = None
-        self._stealth_ctx = None
-        print("[HLTV] Browser reset — will re-init on next cycle")
 
     # ──────────────────────────────────────────────────────────────────
     # TEAM NAME NORMALIZER
