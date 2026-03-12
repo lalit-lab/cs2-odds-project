@@ -123,69 +123,97 @@ class OddsScraper:
 
     def _discover_data_url(self, html: str):
         """
-        Find bcwp.hltv.org <script src="..."> tags, fetch each JS file,
-        search for the path pattern used to construct data URLs.
+        Multiple strategies to find where bc-sports-blocks fetches odds data from.
         """
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, "html.parser")
+
+        # ── Strategy A: read the big bc-sports-blocks JS ─────────────
         bcwp_scripts = [
             s["src"] for s in soup.find_all("script", src=True)
-            if "bcwp.hltv.org" in s.get("src", "") or "bc-blocks" in s.get("src", "")
+            if "bcwp.hltv.org" in s.get("src", "")
+            or "assets-bcwp.hltv.org" in s.get("src", "")
         ]
-        print(f"[HLTV] bcwp script tags found: {len(bcwp_scripts)}")
-        for src in bcwp_scripts[:5]:
-            print(f"[HLTV]   {src}")
-
         for js_url in bcwp_scripts:
             try:
                 r = self._session.get(js_url, timeout=10)
                 if r.status_code != 200:
                     continue
                 js = r.text
-                print(f"[HLTV] JS file {js_url.split('/')[-1]} ({len(js)} chars)")
 
-                # Search for the data file path in the JS
-                hits = re.findall(
-                    r'(?:wp-content/uploads/bc-blocks-data/|bc-blocks-data/)[^\s\'"]+',
-                    js
-                )
-                if hits:
-                    print(f"[HLTV] Data path patterns in JS: {hits[:10]}")
-                    # Take the most relevant-looking one
-                    for h in hits:
-                        if "offers" in h.lower() or "data" in h.lower() or "sync" in h.lower():
-                            base = h.split("?")[0]  # strip query params
-                            self._data_url_base = f"https://bcwp.hltv.org/{base}"
-                            print(f"[HLTV] Using data URL base: {self._data_url_base}")
+                # Broad search: any string containing "bc-blocks" or "uploads"
+                for term in ["bc-blocks-data", "uploads/bc", "syncOffers",
+                             "offersData", "getData", "getOffers"]:
+                    if term in js:
+                        idx = js.index(term)
+                        ctx = js[max(0, idx - 120):idx + 250]
+                        print(f"[HLTV JS] '{term}' in {js_url.split('/')[-1].split('?')[0]}: {ctx}")
+
+                # Any https://bcwp URL
+                urls = re.findall(r'https?://(?:assets-)?bcwp\.hltv\.org[^\s\'"\\,)]+', js)
+                if urls:
+                    print(f"[HLTV JS] bcwp URLs: {urls[:8]}")
+                    for u in urls:
+                        if any(k in u for k in ["offers", "data", "sync", "json"]):
+                            self._data_url_base = u.split("?")[0]
+                            print(f"[HLTV] Data URL found in JS: {self._data_url_base}")
                             return
 
-                # Also search for fetch/axios/XHR calls to bc-blocks or wp-admin
-                ajax_hits = re.findall(r'https?://bcwp\.hltv\.org[^\s\'"]+', js)
-                if ajax_hits:
-                    print(f"[HLTV] Direct bcwp URLs in JS: {ajax_hits[:10]}")
-
-                # Log a snippet near "syncOffersData" if found
-                if "syncOffersData" in js:
-                    idx = js.index("syncOffersData")
-                    print(f"[HLTV] syncOffersData context: {js[max(0,idx-150):idx+200]}")
-                if "offersData" in js or "offers" in js.lower():
-                    idx = js.lower().index("offers")
-                    print(f"[HLTV] 'offers' context: {js[max(0,idx-100):idx+200]}")
+                # fetch/XHR patterns
+                fetches = re.findall(r'fetch\(([^)]{5,80})\)', js)
+                if fetches:
+                    print(f"[HLTV JS] fetch() calls: {fetches[:5]}")
 
             except Exception as e:
-                print(f"[HLTV] JS fetch error {js_url}: {e}")
+                print(f"[HLTV JS] error {js_url}: {e}")
 
-        # If no bcwp scripts, look for inline JS with path patterns
-        all_js = " ".join(s.get_text() for s in soup.find_all("script") if not s.get("src"))
-        hits = re.findall(r'bc-blocks-data/[^\s\'"\\]+', all_js)
-        if hits:
-            print(f"[HLTV] Inline JS path patterns: {hits[:10]}")
-            for h in hits:
-                if any(k in h.lower() for k in ["offers", "data", "sync"]):
-                    self._data_url_base = f"https://bcwp.hltv.org/wp-content/uploads/{h.split('?')[0]}"
-                    print(f"[HLTV] Using data URL base from inline JS: {self._data_url_base}")
+        # ── Strategy B: try directory listing ─────────────────────────
+        try:
+            r = self._session.get(
+                "http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data/",
+                timeout=8
+            )
+            print(f"[HLTV DIR] status={r.status_code}, size={len(r.text)}: {r.text[:600]}")
+        except Exception as e:
+            print(f"[HLTV DIR] error: {e}")
+
+        # ── Strategy C: try WordPress REST API ────────────────────────
+        for path in [
+            "wp-json/bc-sports-blocks/v1/events",
+            "wp-json/bc-blocks/v1/offers",
+            "wp-json/bc-sports-blocks/v1/odds",
+            "wp-json/",
+        ]:
+            try:
+                r = self._session.get(
+                    f"https://bcwp.hltv.org/{path}", timeout=8
+                )
+                print(f"[HLTV REST] {path} → {r.status_code}: {r.text[:300]}")
+                if r.status_code == 200 and ('"offers"' in r.text or '"matches"' in r.text
+                                              or '"events"' in r.text):
+                    self._data_url_base = f"https://bcwp.hltv.org/{path}"
+                    print(f"[HLTV] REST endpoint found: {self._data_url_base}")
                     return
+            except Exception as e:
+                print(f"[HLTV REST] {path} error: {e}")
+
+        # ── Strategy D: try plausible timestamp-based filenames ───────
+        ts = 1773207330  # syncOffersData value
+        for pattern in [
+            f"http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data/{ts}.json",
+            f"http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data/offers/{ts}.json",
+            f"http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data/syncOffersData/{ts}.json",
+        ]:
+            try:
+                r = self._session.get(pattern, timeout=5)
+                print(f"[HLTV TS] {pattern.split('/')[-2:][-1]} → {r.status_code}, {len(r.text)} chars")
+                if r.status_code == 200 and r.text.strip().startswith(("{", "[")):
+                    self._data_url_base = pattern
+                    print(f"[HLTV] Timestamp URL works: {self._data_url_base}")
+                    return
+            except Exception:
+                pass
 
     def _extract_nonce(self, html: str) -> str:
         m = re.search(r'"bcb_security"\s*:\s*"([^"]+)"', html)
