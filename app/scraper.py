@@ -54,6 +54,11 @@ BOOKMAKER_NAMES = {
 class OddsScraper:
     def __init__(self):
         self.odds_api_key = os.getenv("ODDS_API_KEY", "")
+        # On Railway/cloud, Playwright often hangs (no display server).
+        # Set HLTV_SCRAPE=true in Railway env vars to enable it there.
+        # Locally it always tries HLTV first.
+        self.use_playwright = os.getenv("RAILWAY_ENVIRONMENT") is None or \
+                              os.getenv("HLTV_SCRAPE", "false").lower() == "true"
 
     # ------------------------------------------------------------------
     # PUBLIC ENTRY POINT
@@ -61,20 +66,26 @@ class OddsScraper:
 
     async def scrape_all_sites(self) -> List[Dict]:
         """
-        Scrape real CS2 odds from HLTV.org betting/money page.
-        Falls back to enhanced realistic mock data if scraping fails.
+        On local: scrapes real CS2 odds from HLTV via Playwright.
+        On Railway/cloud: uses realistic mock data with real team names.
+        Falls back to mock data if HLTV scraping fails or times out.
         """
-        try:
-            data = await asyncio.get_event_loop().run_in_executor(
-                None, self._scrape_hltv_sync
-            )
-            if data:
-                print(f"[HLTV] Successfully scraped {len(data)} odds entries from {len(set(d['source'] for d in data))} bookmakers")
-                return self.normalize_team_names(data)
-            else:
+        if self.use_playwright:
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, self._scrape_hltv_sync),
+                    timeout=40.0
+                )
+                if data:
+                    print(f"[HLTV] Scraped {len(data)} entries from {len(set(d['source'] for d in data))} bookmakers")
+                    return self.normalize_team_names(data)
                 print("[HLTV] No data returned, using mock data")
-        except Exception as e:
-            print(f"[HLTV] Scraping failed: {e}, using mock data")
+            except asyncio.TimeoutError:
+                print("[HLTV] Timed out after 40s, using mock data")
+            except Exception as e:
+                print(f"[HLTV] Failed: {e}, using mock data")
+        else:
+            print("[Scraper] Cloud mode — using realistic mock data")
 
         data = await self._generate_realistic_mock()
         return self.normalize_team_names(data)
