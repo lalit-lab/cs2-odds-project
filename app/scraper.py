@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
-from typing import List, Dict
+import re
+import json
+from typing import List, Dict, Optional
 from datetime import datetime
 from fuzzywuzzy import fuzz
 from dotenv import load_dotenv
@@ -27,20 +29,25 @@ BOOKMAKER_NAMES = {
     "2up": "2UP",
 }
 
+AJAX_URL = "https://bcwp.hltv.org/wp-admin/admin-ajax.php"
+
 
 class OddsScraper:
     """
-    Scrapes real CS2 odds from HLTV.org using curl_cffi to bypass
-    Cloudflare without needing a full browser.
+    Scrapes real CS2 odds from HLTV.org.
 
-    curl_cffi mimics Chrome's exact TLS fingerprint — works on datacenter
-    IPs (Railway, etc.) where headless Playwright gets blocked.
+    HLTV's /betting/money page embeds a WordPress-based betting widget
+    (bcwp.hltv.org). The odds are NOT in the initial HTML — they're
+    fetched via WordPress admin-ajax.php AJAX calls.
 
-    Keeps a persistent session so Cloudflare cookies are reused across
-    scrape cycles (~1-2s per cycle after the first request).
+    Strategy:
+      1. Fetch hltv.org/betting/money to extract the bcb_security nonce
+         and configUrl embedded in the page JS.
+      2. Fetch configUrl to get the list of matches/blocks.
+      3. For each block, call admin-ajax.php to get real odds data.
 
-    No mock data — returns [] if scraping fails so the UI shows an honest
-    "no data" state rather than fake numbers.
+    Uses curl_cffi (Chrome TLS impersonation) for all requests so
+    Cloudflare doesn't block us.
     """
 
     def __init__(self):
@@ -54,32 +61,27 @@ class OddsScraper:
     # ──────────────────────────────────────────────────────────────────
 
     async def scrape_all_sites(self) -> List[Dict]:
-        """Real HLTV data only. Uses curl_cffi to bypass Cloudflare."""
         try:
             loop = asyncio.get_event_loop()
             data = await asyncio.wait_for(
                 loop.run_in_executor(self._executor, self._fetch_and_parse),
-                timeout=30.0,
+                timeout=40.0,
             )
-
             if data:
                 print(f"[HLTV] {len(data)} odds entries from "
                       f"{len(set(d['source'] for d in data))} bookmakers")
                 return self.normalize_team_names(data)
-
-            print("[HLTV] Page fetched but no odds parsed")
-
+            print("[HLTV] No odds parsed this cycle")
         except asyncio.TimeoutError:
-            print("[HLTV] Request timed out — will retry next cycle")
-            self._session = None  # reset session so next attempt gets fresh cookies
-        except Exception as e:
-            print(f"[HLTV] Error: {e} — will retry next cycle")
+            print("[HLTV] Timed out — resetting session")
             self._session = None
-
-        return []  # real empty — no mock
+        except Exception as e:
+            print(f"[HLTV] Error: {e}")
+            self._session = None
+        return []
 
     # ──────────────────────────────────────────────────────────────────
-    # HTTP FETCH  (runs in executor thread)
+    # MAIN FETCH LOGIC  (runs in executor thread)
     # ──────────────────────────────────────────────────────────────────
 
     def _fetch_and_parse(self) -> List[Dict]:
@@ -87,125 +89,243 @@ class OddsScraper:
 
         if self._session is None:
             self._session = cffi_requests.Session(impersonate="chrome120")
-            print("[HLTV] New curl_cffi session created")
+            print("[HLTV] New session created")
 
+        # ── Step 1: fetch main page, extract nonce + configUrl ────────
         resp = self._session.get(
             "https://www.hltv.org/betting/money",
             timeout=20,
             headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
             },
         )
-
         if resp.status_code != 200:
-            print(f"[HLTV] HTTP {resp.status_code} — Cloudflare may have blocked request")
+            print(f"[HLTV] Main page HTTP {resp.status_code} — resetting session")
             self._session = None
             return []
 
-        print(f"[HLTV] HTTP {resp.status_code} — parsing HTML ({len(resp.text)} chars)")
-        return self._parse_html(resp.text)
+        html = resp.text
+        nonce, config_url = self._extract_widget_config(html)
+
+        if not nonce or not config_url:
+            print(f"[HLTV] Could not extract nonce/configUrl — nonce={nonce!r} configUrl={config_url!r}")
+            print(f"[HLTV] Page snippet: {html[5000:5500]}")
+            self._session = None
+            return []
+
+        print(f"[HLTV] nonce={nonce}  configUrl={config_url}")
+
+        # ── Step 2: fetch widget config JSON ──────────────────────────
+        cfg_resp = self._session.get(config_url, timeout=15)
+        if cfg_resp.status_code != 200:
+            print(f"[HLTV] configUrl HTTP {cfg_resp.status_code}")
+            return []
+
+        try:
+            config = cfg_resp.json()
+        except Exception as e:
+            print(f"[HLTV] configUrl not valid JSON: {e}")
+            print(f"[HLTV] configUrl raw: {cfg_resp.text[:500]}")
+            return []
+
+        print(f"[HLTV] Config top-level keys: {list(config.keys())[:15]}")
+
+        # ── Step 3: extract odds from config or via AJAX ──────────────
+        results = self._extract_odds_from_config(config, nonce)
+        if not results:
+            # Config didn't have inline odds — try AJAX call
+            results = self._fetch_odds_via_ajax(config, nonce)
+        return results
 
     # ──────────────────────────────────────────────────────────────────
-    # HTML PARSER
+    # HELPERS
     # ──────────────────────────────────────────────────────────────────
 
-    def _parse_html(self, html: str) -> List[Dict]:
-        from bs4 import BeautifulSoup
-        import re
+    def _extract_widget_config(self, html: str):
+        """Pull bcb_security nonce and configUrl out of the page JS."""
+        nonce = None
+        config_url = None
 
-        soup = BeautifulSoup(html, "html.parser")
+        # blocksData variable in a <script> tag
+        m = re.search(r'var\s+blocksData\s*=\s*(\{.*?\})\s*;', html, re.DOTALL)
+        if m:
+            try:
+                raw = m.group(1).replace('\\/', '/')
+                data = json.loads(raw)
+                nonce = data.get("bcb_security") or data.get("security")
+                config_url = data.get("configUrl") or data.get("config_url")
+            except Exception:
+                pass
+
+        # Fallback: regex directly
+        if not nonce:
+            nm = re.search(r'"bcb_security"\s*:\s*"([^"]+)"', html)
+            if nm:
+                nonce = nm.group(1)
+        if not config_url:
+            cm = re.search(r'"configUrl"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+            if cm:
+                config_url = cm.group(1).replace('\\/', '/')
+
+        return nonce, config_url
+
+    def _extract_odds_from_config(self, config: dict, nonce: str) -> List[Dict]:
+        """
+        Some widget configs include inline odds data.
+        Try common key names.
+        """
         results = []
 
-        # Debug: show what's actually in the page
-        containers = soup.find_all("div", class_="b-match-container")
-        print(f"[HLTV DEBUG] b-match-container found: {len(containers)}")
+        # Try to find match/event data at common keys
+        matches = (
+            config.get("matches") or
+            config.get("events") or
+            config.get("games") or
+            config.get("data") or
+            []
+        )
 
-        # Check for embedded JSON data (common SPA pattern)
-        scripts = soup.find_all("script")
-        for s in scripts:
-            txt = s.get_text()
-            if "bookmaker" in txt.lower() or "betting" in txt.lower() or "odds" in txt.lower():
-                print(f"[HLTV DEBUG] Found script with odds/betting keywords (first 300 chars): {txt[:300]}")
-                break
+        if not matches:
+            print(f"[HLTV] Config has no inline matches. Keys: {list(config.keys())}")
+            return []
 
-        # Check what top-level divs exist (to find correct container class)
-        main_div = soup.find("div", id="main-content") or soup.find("div", class_="contentCol")
-        if main_div:
-            child_classes = [
-                " ".join(c.get("class", [])) for c in main_div.children
-                if hasattr(c, "get") and c.get("class")
-            ]
-            print(f"[HLTV DEBUG] Main content children classes: {child_classes[:5]}")
-        else:
-            print("[HLTV DEBUG] No #main-content or .contentCol found")
-            # Print first few div classes to understand page structure
-            top_divs = [" ".join(d.get("class", [])) for d in soup.find_all("div", limit=20) if d.get("class")]
-            print(f"[HLTV DEBUG] First 20 div classes: {top_divs}")
+        print(f"[HLTV] Config has {len(matches)} inline entries")
+        # Log the first entry so we learn its shape
+        if matches:
+            print(f"[HLTV] First entry keys: {list(matches[0].keys()) if isinstance(matches[0], dict) else matches[0]}")
 
-        for mc in soup.find_all("div", class_="b-match-container"):
-            table = mc.find("table", class_="bookmakerMatch")
-            if not table:
+        for match in matches:
+            if not isinstance(match, dict):
                 continue
-            rows = table.find_all("tr", class_="teamrow")
-            if len(rows) != 2:
-                continue
-
-            def _team(row):
-                box = row.find("td", class_="bookmakerTeamBox")
-                if not box:
-                    return None
-                img = box.find("img")
-                if img and img.get("alt"):
-                    return img["alt"].strip()
-                a = box.find("a")
-                return a.get_text(strip=True) if a else None
-
-            team_a, team_b = _team(rows[0]), _team(rows[1])
+            team_a = match.get("team1") or match.get("home") or match.get("teamA") or ""
+            team_b = match.get("team2") or match.get("away") or match.get("teamB") or ""
             if not team_a or not team_b:
                 continue
-
-            for ca, cb in zip(
-                rows[0].find_all("td", class_="odds"),
-                rows[1].find_all("td", class_="odds"),
-            ):
-                bm_key = next(
-                    (
-                        c.replace("b-list-odds-provider-", "")
-                        for c in ca.get("class", [])
-                        if c.startswith("b-list-odds-provider-")
-                    ),
-                    None,
-                )
-                if not bm_key:
+            bookmakers = match.get("bookmakers") or match.get("odds") or []
+            for bm in bookmakers:
+                if not isinstance(bm, dict):
                     continue
-
-                bm_name = BOOKMAKER_NAMES.get(bm_key.lower(), bm_key.title())
-                tag_a, tag_b = ca.find("a"), cb.find("a")
-                if not tag_a or not tag_b:
-                    continue
-
+                bm_name = bm.get("name") or bm.get("bookmaker") or ""
                 try:
-                    odds_a = round(float(tag_a.get_text(strip=True)), 2)
-                    odds_b = round(float(tag_b.get_text(strip=True)), 2)
-                except ValueError:
+                    odds_a = round(float(bm.get("odds1") or bm.get("oddsHome") or bm.get("team1") or 0), 2)
+                    odds_b = round(float(bm.get("odds2") or bm.get("oddsAway") or bm.get("team2") or 0), 2)
+                except (ValueError, TypeError):
                     continue
+                if odds_a and odds_b:
+                    results.append({
+                        "source": bm_name,
+                        "team_a": team_a,
+                        "team_b": team_b,
+                        "team_a_odds": odds_a,
+                        "team_b_odds": odds_b,
+                        "match_time": datetime.utcnow().isoformat(),
+                    })
+        return results
 
-                results.append({
-                    "source": bm_name,
-                    "team_a": team_a,
-                    "team_b": team_b,
-                    "team_a_odds": odds_a,
-                    "team_b_odds": odds_b,
-                    "match_time": datetime.utcnow().isoformat(),
-                })
+    def _fetch_odds_via_ajax(self, config: dict, nonce: str) -> List[Dict]:
+        """
+        Call bcwp.hltv.org/wp-admin/admin-ajax.php to get odds.
+        Try common WordPress action names used by betting widgets.
+        """
+        results = []
 
+        # Common actions used by BCB (Betting Content Builder) plugins
+        actions_to_try = [
+            "bcb_get_events",
+            "bcb_get_odds",
+            "bcb_get_matches",
+            "get_betting_data",
+            "bcb_load_block",
+        ]
+
+        # Some configs embed the action name
+        action = (
+            config.get("action") or
+            config.get("ajax_action") or
+            config.get("wp_action")
+        )
+        if action:
+            actions_to_try.insert(0, action)
+
+        for act in actions_to_try:
+            try:
+                r = self._session.post(
+                    AJAX_URL,
+                    data={
+                        "action": act,
+                        "security": nonce,
+                        "nonce": nonce,
+                    },
+                    timeout=10,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": "https://www.hltv.org/betting/money",
+                        "Origin": "https://www.hltv.org",
+                    },
+                )
+                print(f"[HLTV AJAX] action={act} → {r.status_code}: {r.text[:300]}")
+                if r.status_code == 200 and r.text.strip() not in ("-1", "0", ""):
+                    try:
+                        payload = r.json()
+                        parsed = self._parse_ajax_response(payload)
+                        if parsed:
+                            print(f"[HLTV AJAX] action={act} returned {len(parsed)} odds entries")
+                            results = parsed
+                            break
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[HLTV AJAX] action={act} error: {e}")
+
+        return results
+
+    def _parse_ajax_response(self, payload) -> List[Dict]:
+        """Parse whatever the AJAX endpoint returns."""
+        results = []
+
+        # payload could be a list of matches, or {"data": [...], "success": true}, etc.
+        if isinstance(payload, dict):
+            payload = (
+                payload.get("data") or
+                payload.get("matches") or
+                payload.get("events") or
+                []
+            )
+
+        if not isinstance(payload, list):
+            print(f"[HLTV AJAX] Unexpected payload type: {type(payload)}")
+            return []
+
+        for match in payload:
+            if not isinstance(match, dict):
+                continue
+            team_a = match.get("team1") or match.get("home") or match.get("teamA") or ""
+            team_b = match.get("team2") or match.get("away") or match.get("teamB") or ""
+            if not team_a or not team_b:
+                continue
+            for bm in (match.get("bookmakers") or match.get("odds") or []):
+                if not isinstance(bm, dict):
+                    continue
+                bm_name = bm.get("name") or bm.get("bookmaker") or ""
+                try:
+                    odds_a = round(float(bm.get("odds1") or bm.get("oddsHome") or 0), 2)
+                    odds_b = round(float(bm.get("odds2") or bm.get("oddsAway") or 0), 2)
+                except (ValueError, TypeError):
+                    continue
+                if odds_a and odds_b:
+                    results.append({
+                        "source": bm_name,
+                        "team_a": team_a,
+                        "team_b": team_b,
+                        "team_a_odds": odds_a,
+                        "team_b_odds": odds_b,
+                        "match_time": datetime.utcnow().isoformat(),
+                    })
         return results
 
     # ──────────────────────────────────────────────────────────────────

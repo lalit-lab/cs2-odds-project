@@ -147,29 +147,6 @@ async def health_check():
     return {"status": "healthy"}
 
 
-@app.get("/api/debug/html")
-async def debug_html():
-    """Fetch raw HLTV HTML so we can inspect the page structure."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-    try:
-        html = await asyncio.wait_for(
-            loop.run_in_executor(None, _fetch_raw_hltv),
-            timeout=25.0
-        )
-        # Return first 3000 chars and last 500 chars so we can see structure
-        preview = html[:3000] + "\n\n...[truncated]...\n\n" + html[-500:] if len(html) > 3500 else html
-        return {"length": len(html), "preview": preview}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _fetch_raw_hltv():
-    from curl_cffi import requests as cffi_requests
-    s = cffi_requests.Session(impersonate="chrome120")
-    resp = s.get("https://www.hltv.org/betting/money", timeout=20)
-    return resp.text
-
 
 @app.get("/api/bookmakers")
 async def get_bookmakers():
