@@ -174,36 +174,29 @@ class OddsScraper:
 
     def _fetch_offers_data(self, config: dict) -> List[Dict]:
         """
-        The update_cache_config.json values are URLs to JSON data files.
-        'syncOffersData' → the main odds/offers file.
-        'syncOperatorsData' → bookmaker info.
-        Fetch them and parse odds.
+        update_cache_config.json values are Unix timestamps (cache versions).
+        The actual data files live at:
+          http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data/{key}.json
+        The timestamp is used by the JS widget to check if its local cache is
+        stale — the file path is always the key name + .json.
         """
-        # Priority order: offers (match odds) > operators (bookmaker metadata)
-        url_keys = ["syncOffersData", "syncOperatorsData"]
-        # Also try region-specific alt-data (India, global)
-        for region in ["IN", "RU", "DE", "BR", "TR", "ID"]:
-            url_keys.append(f"bcblSyncAltData_{region}")
+        BASE = "http://bcwp.hltv.org/wp-content/uploads/bc-blocks-data"
 
-        for key in url_keys:
-            val = config.get(key)
-            if not val:
-                continue
-            # Values can be a URL string OR a dict with a url key
-            url = None
-            if isinstance(val, str) and val.startswith("http"):
-                url = val
-            elif isinstance(val, dict):
-                url = val.get("url") or val.get("dataUrl") or val.get("file")
+        # Priority: offers (match odds) > operators > region-specific
+        keys_to_try = ["syncOffersData", "syncOperatorsData"]
+        for region in ["IN", "RU", "DE", "BR", "TR", "ID", "GB"]:
+            keys_to_try.append(f"bcblSyncAltData_{region}")
 
-            if not url:
-                print(f"[HLTV] {key} value is not a URL: {str(val)[:100]}")
-                continue
+        # Only try keys that actually exist in the config
+        keys_to_try = [k for k in keys_to_try if k in config]
 
-            print(f"[HLTV] Fetching {key}: {url}")
+        for key in keys_to_try:
+            timestamp = config[key]
+            url = f"{BASE}/{key}.json"
+            print(f"[HLTV] Fetching {key} (ts={timestamp}): {url}")
             try:
                 r = self._session.get(url, timeout=15)
-                print(f"[HLTV] {key} → {r.status_code}, {len(r.text)} chars: {r.text[:400]}")
+                print(f"[HLTV] {key} → {r.status_code}, {len(r.text)} chars: {r.text[:500]}")
                 if r.status_code == 200 and r.text.strip():
                     try:
                         data = r.json()
