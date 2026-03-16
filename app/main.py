@@ -270,10 +270,10 @@ async def scraper_status():
 async def scraping_loop():
     global live_odds_cache, arbitrage_cache, last_update, scraping_active
 
-    # SCRAPE_INTERVAL env var controls update speed:
-    # - Local (HLTV): keep 18s (scrape itself takes ~15-20s)
-    # - Railway (mock): set SCRAPE_INTERVAL=5 in Railway env vars for near-live feel
-    interval = int(os.getenv("SCRAPE_INTERVAL", "12"))
+    # SCRAPE_INTERVAL env var controls how often we hit external sites.
+    # Default 120s — avoids 429 rate-limits from OddsPortal/HLTV.
+    # Set SCRAPE_INTERVAL=30 in Railway env vars if you want faster updates.
+    interval = int(os.getenv("SCRAPE_INTERVAL", "120"))
     last_hash = ""
     print(f"Scraping loop started (interval={interval}s)")
 

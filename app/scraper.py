@@ -561,46 +561,121 @@ class OddsScraper:
 
     def _fetch_oddsportal_matches(self) -> List[Dict]:
         from curl_cffi import requests as cffi_requests
+        from bs4 import BeautifulSoup
         if self._session is None:
             self._session = cffi_requests.Session(impersonate="chrome120")
         try:
             r = self._session.get(
                 "https://www.oddsportal.com/esports/counter-strike/",
-                timeout=15,
-                headers={"Accept": "text/html,*/*", "Referer": "https://www.oddsportal.com/"},
+                timeout=20,
+                headers={
+                    "User-Agent":      _load_useragent(),
+                    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer":         "https://www.oddsportal.com/",
+                },
             )
             print(f"[ODDSPORTAL] HTTP {r.status_code}, {len(r.text)} chars")
             if r.status_code != 200:
                 return []
+
             html = r.text
-            m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
-                          html, re.DOTALL)
+            matches = []
+
+            # ── Strategy A: __NEXT_DATA__ JSON blob ───────────────────
+            m = re.search(
+                r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
+                html, re.DOTALL
+            )
             if m:
                 try:
                     nd = json.loads(m.group(1))
                     matches = self._extract_op_matches(nd)
                     if matches:
+                        print(f"[ODDSPORTAL] Strategy A (NEXT_DATA): {len(matches)} matches")
                         return matches
                 except Exception as e:
-                    print(f"[ODDSPORTAL] parse error: {e}")
+                    print(f"[ODDSPORTAL] NEXT_DATA parse error: {e}")
+
+            # ── Strategy B: any inline JSON with home/away team names ─
+            for js_m in re.finditer(r'({[^<]{30,}})', html):
+                try:
+                    obj = json.loads(js_m.group(1))
+                    home = obj.get("home-name") or obj.get("homeName") or obj.get("home")
+                    away = obj.get("away-name") or obj.get("awayName") or obj.get("away")
+                    if home and away and isinstance(home, str) and isinstance(away, str):
+                        if 2 < len(home) < 40 and 2 < len(away) < 40:
+                            matches.append({"team_a": home.strip(), "team_b": away.strip()})
+                except Exception:
+                    pass
+            if matches:
+                print(f"[ODDSPORTAL] Strategy B (inline JSON): {len(matches)} matches")
+                return matches[:20]
+
+            # ── Strategy C: BeautifulSoup — event rows ─────────────────
+            soup = BeautifulSoup(html, "html.parser")
+            seen_pairs = set()
+            for row in soup.find_all(["a", "div"], href=re.compile(r"/esports/counter-strike/.+/.+")):
+                text = row.get_text(" ", strip=True)
+                parts = re.split(r'\s*[-–vs]+\s*', text, maxsplit=1)
+                if len(parts) == 2:
+                    ta, tb = parts[0].strip(), parts[1].strip()
+                    ta = re.sub(r'\s+\d.*', '', ta).strip()
+                    tb = re.sub(r'\s+\d.*', '', tb).strip()
+                    key = f"{ta}|{tb}"
+                    if 2 < len(ta) < 40 and 2 < len(tb) < 40 and key not in seen_pairs:
+                        seen_pairs.add(key)
+                        matches.append({"team_a": ta, "team_b": tb})
+            if matches:
+                print(f"[ODDSPORTAL] Strategy C (links): {len(matches)} matches")
+                return matches[:20]
+
+            # ── Strategy D: regex — "TeamA - TeamB" patterns ──────────
+            for m2 in re.finditer(
+                r'([A-Z][A-Za-z0-9 \.\-\']{2,25})\s*[-–]\s*([A-Z][A-Za-z0-9 \.\-\']{2,25})',
+                html
+            ):
+                ta, tb = m2.group(1).strip(), m2.group(2).strip()
+                if ta != tb:
+                    matches.append({"team_a": ta, "team_b": tb})
+            if matches:
+                # deduplicate
+                seen = set()
+                unique = []
+                for m3 in matches:
+                    k = f"{m3['team_a']}|{m3['team_b']}"
+                    if k not in seen:
+                        seen.add(k)
+                        unique.append(m3)
+                print(f"[ODDSPORTAL] Strategy D (regex): {len(unique)} matches")
+                return unique[:20]
+
+            # debug: print page snippet so we can see what's there
+            print(f"[ODDSPORTAL] No matches found. Snippet: {html[1000:1500]!r}")
             return []
+
         except Exception as e:
             print(f"[ODDSPORTAL] Error: {e}")
             return []
 
     def _extract_op_matches(self, data, depth=0) -> List[Dict]:
-        if depth > 6 or not isinstance(data, (dict, list)):
+        if depth > 8 or not isinstance(data, (dict, list)):
             return []
         matches = []
         if isinstance(data, dict):
-            home = data.get("home-name") or data.get("home") or data.get("homeTeam")
-            away = data.get("away-name") or data.get("away") or data.get("awayTeam")
+            home = (data.get("home-name") or data.get("homeName") or
+                    data.get("home")      or data.get("homeTeam") or
+                    data.get("team1")     or data.get("teamOne"))
+            away = (data.get("away-name") or data.get("awayName") or
+                    data.get("away")      or data.get("awayTeam") or
+                    data.get("team2")     or data.get("teamTwo"))
             if home and away and isinstance(home, str) and isinstance(away, str):
-                return [{"team_a": home.strip(), "team_b": away.strip()}]
+                if 2 < len(home) < 40 and 2 < len(away) < 40:
+                    return [{"team_a": home.strip(), "team_b": away.strip()}]
             for v in data.values():
                 matches.extend(self._extract_op_matches(v, depth + 1))
         elif isinstance(data, list):
-            for item in data[:50]:
+            for item in data[:100]:
                 matches.extend(self._extract_op_matches(item, depth + 1))
         return matches[:20]
 
