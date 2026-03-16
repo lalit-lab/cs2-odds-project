@@ -237,9 +237,7 @@ class OddsScraper:
             print(f"[HLTV BETTING] HTTP {r.status_code}, {len(r.text)} chars")
 
             if r.status_code in (403, 503):
-                print("[HLTV BETTING] Blocked — cookies expired or invalid. "
-                      "Re-export cookies from your browser.")
-                self._session = None
+                print("[HLTV BETTING] Blocked (403/503) — Cloudflare IP block on this server.")
                 return []
 
             if r.status_code != 200:
@@ -248,8 +246,21 @@ class OddsScraper:
 
             # Check if Cloudflare challenge page returned
             if "cf-browser-verification" in r.text or "Checking your browser" in r.text:
-                print("[HLTV BETTING] Cloudflare challenge page — cookies expired.")
+                print("[HLTV BETTING] Cloudflare challenge page returned.")
                 return []
+
+            # Debug: log first 500 chars + all unique class names to help tune parser
+            from bs4 import BeautifulSoup as _BS
+            _soup = _BS(r.text, "html.parser")
+            _classes = set()
+            for tag in _soup.find_all(True):
+                for c in (tag.get("class") or []):
+                    _classes.add(c)
+            _bet_classes = sorted(c for c in _classes if any(
+                k in c.lower() for k in ("bet","odd","match","team","book","money")
+            ))
+            print(f"[HLTV BETTING] Page classes with bet/odd/match/team: {_bet_classes[:30]}")
+            print(f"[HLTV BETTING] Page snippet: {r.text[2000:2500]!r}")
 
             return self._parse_hltv_betting_page(r.text)
 
@@ -482,6 +493,9 @@ class OddsScraper:
     def _fetch_hltv_matches(self, cookies: Optional[Dict] = None) -> List[Dict]:
         """Scrape HLTV /matches for real team names (used when betting page fails)."""
         from bs4 import BeautifulSoup
+        from curl_cffi import requests as cffi_requests
+        if self._session is None:
+            self._session = cffi_requests.Session(impersonate="chrome120")
         ua = _load_useragent()
         try:
             r = self._session.get(
@@ -546,6 +560,9 @@ class OddsScraper:
     # ──────────────────────────────────────────────────────────────────
 
     def _fetch_oddsportal_matches(self) -> List[Dict]:
+        from curl_cffi import requests as cffi_requests
+        if self._session is None:
+            self._session = cffi_requests.Session(impersonate="chrome120")
         try:
             r = self._session.get(
                 "https://www.oddsportal.com/esports/counter-strike/",
