@@ -175,20 +175,27 @@ class OddsScraper:
         if self._session is None:
             self._session = cffi_requests.Session(impersonate="chrome120")
 
-        # ── Try 1: HLTV /betting/money with saved cookies (real odds) ──
         cookies = _load_cookies()
+
+        # ── Try 1: HLTV /betting/money with saved cookies ──────────────
         if cookies:
             real_odds = self._fetch_hltv_betting_odds(cookies)
             if real_odds:
                 print(f"[SCRAPER] Got REAL odds for {len(real_odds)} bookmaker-match pairs")
                 return real_odds
-            print("[SCRAPER] Cookie fetch returned nothing — cookies may be expired. "
-                  "Re-export from browser and save to cookies/hltv_cookies.json")
-        else:
-            print("[SCRAPER] No cookies found — using fallback. "
-                  "See cookies/README.md to set up one-time login.")
+            print("[SCRAPER] Cookie fetch returned nothing — cookies may be expired.")
 
-        # ── Try 2: HLTV /matches (real team names) + generated odds ───
+        # ── Try 2: HLTV /betting/money WITHOUT cookies (TLS impersonation only) ──
+        # curl_cffi impersonates Chrome's TLS fingerprint which alone can bypass
+        # Cloudflare's bot detection without needing browser cookies.
+        print("[SCRAPER] Trying /betting/money without cookies (TLS impersonation)...")
+        real_odds = self._fetch_hltv_betting_odds({})
+        if real_odds:
+            print(f"[SCRAPER] Got REAL odds via TLS impersonation ({len(real_odds)} entries)")
+            return real_odds
+
+        # ── Try 3: HLTV /matches (real team names) + generated odds ────
+        print("[SCRAPER] Falling back to /matches + generated odds")
         matches = self._fetch_hltv_matches(cookies)
         if not matches:
             matches = self._fetch_oddsportal_matches()
