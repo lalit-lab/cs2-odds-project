@@ -136,7 +136,8 @@ class OddsScraper:
     """
 
     def __init__(self):
-        self._session  = None
+        self._session       = None
+        self._hltv_blocked  = False   # set True after first confirmed IP block
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="odds_http"
         )
@@ -177,22 +178,23 @@ class OddsScraper:
 
         cookies = _load_cookies()
 
-        # ── Try 1: HLTV /betting/money with saved cookies ──────────────
-        if cookies:
-            real_odds = self._fetch_hltv_betting_odds(cookies)
-            if real_odds:
-                print(f"[SCRAPER] Got REAL odds for {len(real_odds)} bookmaker-match pairs")
-                return real_odds
-            print("[SCRAPER] Cookie fetch returned nothing — cookies may be expired.")
+        if not self._hltv_blocked:
+            # ── Try 1: HLTV /betting/money with saved cookies ──────────
+            if cookies:
+                real_odds = self._fetch_hltv_betting_odds(cookies)
+                if real_odds:
+                    print(f"[SCRAPER] Got REAL odds for {len(real_odds)} bookmaker-match pairs")
+                    return real_odds
+                print("[SCRAPER] Cookie fetch returned nothing — cookies may be expired.")
 
-        # ── Try 2: HLTV /betting/money WITHOUT cookies (TLS impersonation only) ──
-        # curl_cffi impersonates Chrome's TLS fingerprint which alone can bypass
-        # Cloudflare's bot detection without needing browser cookies.
-        print("[SCRAPER] Trying /betting/money without cookies (TLS impersonation)...")
-        real_odds = self._fetch_hltv_betting_odds({})
-        if real_odds:
-            print(f"[SCRAPER] Got REAL odds via TLS impersonation ({len(real_odds)} entries)")
-            return real_odds
+            # ── Try 2: HLTV /betting/money without cookies (TLS only) ──
+            print("[SCRAPER] Trying /betting/money without cookies (TLS impersonation)...")
+            real_odds = self._fetch_hltv_betting_odds({})
+            if real_odds:
+                print(f"[SCRAPER] Got REAL odds via TLS impersonation ({len(real_odds)} entries)")
+                return real_odds
+        else:
+            print("[SCRAPER] HLTV IP-blocked on this server — skipping HLTV, using OddsPortal")
 
         # ── Try 3: HLTV /matches (real team names) + generated odds ────
         print("[SCRAPER] Falling back to /matches + generated odds")
@@ -238,6 +240,7 @@ class OddsScraper:
 
             if r.status_code in (403, 503):
                 print("[HLTV BETTING] Blocked (403/503) — Cloudflare IP block on this server.")
+                self._hltv_blocked = True
                 return []
 
             if r.status_code != 200:
@@ -686,19 +689,32 @@ class OddsScraper:
     def _generate_odds(self, matches: List[Dict]) -> List[Dict]:
         """
         Deterministic mock odds — used ONLY when real odds are unavailable.
-        Each bookmaker applies its own margin so natural arbitrage appears.
+        Each bookmaker has its own probability view (±4%) so the best odds
+        across bookmakers occasionally create real arbitrage opportunities.
         """
         results = []
         for match in matches:
             team_a = match["team_a"]
             team_b = match["team_b"]
+
+            # Base seed from team names — stable across cycles
             seed = int(hashlib.md5(
                 f"{team_a.lower()}{team_b.lower()}".encode()
             ).hexdigest()[:8], 16)
-            prob_a = 0.35 + (seed % 1000) / 3333.0
+            base_prob_a = 0.35 + (seed % 1000) / 3333.0
 
-            for bm_name in BOOKMAKER_NAMES:
+            for i, bm_name in enumerate(BOOKMAKER_NAMES):
                 margin = BM_MARGINS[bm_name]
+
+                # Each bookmaker has a unique probability view (±4% shift)
+                # seeded on both match AND bookmaker so it's stable
+                bm_seed = int(hashlib.md5(
+                    f"{team_a.lower()}{team_b.lower()}{bm_name}".encode()
+                ).hexdigest()[:4], 16)
+                # shift in range [-0.04, +0.04]
+                prob_shift = ((bm_seed % 800) - 400) / 10000.0
+                prob_a = max(0.05, min(0.95, base_prob_a + prob_shift))
+
                 fair_a = 1.0 / prob_a
                 fair_b = 1.0 / (1.0 - prob_a)
                 odds_a = round(fair_a * (1.0 - margin * 0.5), 2)
@@ -712,7 +728,7 @@ class OddsScraper:
                     "team_a_odds": odds_a,
                     "team_b_odds": odds_b,
                     "match_time":  datetime.utcnow().isoformat(),
-                    "real_odds":   False,   # flag so UI can show "mock" warning
+                    "real_odds":   False,
                 })
         return results
 
