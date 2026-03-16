@@ -80,6 +80,40 @@
     }
     .odds-source-badge.real  { background: rgba(0,200,100,0.15); color: #00c864; border: 1px solid rgba(0,200,100,0.4); }
     .odds-source-badge.mock  { background: rgba(255,160,0,0.15);  color: #ffa000; border: 1px solid rgba(255,160,0,0.4); }
+
+    /* ── MAIN TABS ────────────────────────────────────── */
+    .main-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 2px solid var(--border);
+      margin-bottom: 20px;
+    }
+    .main-tab {
+      padding: 10px 24px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .main-tab:hover { color: var(--text); }
+    .main-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .main-tab .tab-badge {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1px 7px;
+      font-size: 0.68rem;
+      font-weight: 700;
+    }
+    .main-tab.active .tab-badge { background: rgba(255,107,53,0.15); border-color: var(--accent); color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
     .nav-right { display: flex; align-items: center; gap: 10px; }
     .btn {
       padding: 7px 16px;
@@ -416,12 +450,20 @@
 <!-- MAIN CONTENT -->
 <div class="container">
 
-  <!-- MATCHES -->
-  <div class="mb-24">
-    <div class="section-title">
-      Live CS2 Matches
-      <span class="count-badge" id="matchCountBadge">0</span>
+  <!-- TAB NAVIGATION -->
+  <div class="main-tabs">
+    <div class="main-tab active" id="tabMatches" onclick="switchMainTab('matches')">
+      CS2 Matches
+      <span class="tab-badge" id="matchCountBadge">0</span>
     </div>
+    <div class="main-tab" id="tabArbitrage" onclick="switchMainTab('arbitrage')">
+      Arbitrage Opportunities
+      <span class="tab-badge" id="arbCountBadge">0</span>
+    </div>
+  </div>
+
+  <!-- MATCHES TAB -->
+  <div class="tab-panel active" id="panelMatches">
     <div id="matchesContainer">
       <div class="loading">
         <div class="spinner"></div>
@@ -430,12 +472,8 @@
     </div>
   </div>
 
-  <!-- ARBITRAGE -->
-  <div class="mt-24">
-    <div class="section-title">
-      Arbitrage Opportunities
-      <span class="count-badge" id="arbCountBadge">0</span>
-    </div>
+  <!-- ARBITRAGE TAB -->
+  <div class="tab-panel" id="panelArbitrage">
     <div id="arbContainer">
       <div class="no-data">No arbitrage opportunities found yet...</div>
     </div>
@@ -516,6 +554,16 @@ let currentUser = localStorage.getItem('cs2_user');
 let authToken   = localStorage.getItem('cs2_token');
 let prevOddsSnapshot = {};   // key: "teamA|||teamB|||source", value: {a, b}
 
+// ── MAIN TAB SWITCHING ────────────────────────────────────────────────────────
+function switchMainTab(tab) {
+  ['matches','arbitrage'].forEach(t => {
+    document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1))
+      .classList.toggle('active', t === tab);
+    document.getElementById('panel' + t.charAt(0).toUpperCase() + t.slice(1))
+      .classList.toggle('active', t === tab);
+  });
+}
+
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -547,13 +595,17 @@ function renderAll(odds, arbitrage, timestamp, connections, realOdds) {
   // Stats
   const matchMap = groupByMatch(odds);
   const uniqueBooks = new Set(odds.map(o => o.source));
-  document.getElementById('statMatches').textContent  = Object.keys(matchMap).length;
+  const matchCount = Object.keys(matchMap).length;
+  document.getElementById('statMatches').textContent  = matchCount;
   document.getElementById('statArb').textContent      = arbitrage.length;
   document.getElementById('statBooks').textContent    = uniqueBooks.size;
   document.getElementById('statOdds').textContent     = odds.length;
   document.getElementById('statUsers').textContent    = connections ?? '—';
-  document.getElementById('matchCountBadge').textContent = Object.keys(matchMap).length;
+  document.getElementById('matchCountBadge').textContent = matchCount;
   document.getElementById('arbCountBadge').textContent   = arbitrage.length;
+  // highlight arb tab badge when there are opportunities
+  document.getElementById('tabArbitrage').style.color =
+    arbitrage.length > 0 ? 'var(--green)' : '';
 
   // Real vs mock odds badge
   const badge = document.getElementById('oddsSourceBadge');
@@ -563,7 +615,7 @@ function renderAll(odds, arbitrage, timestamp, connections, realOdds) {
       badge.textContent = 'Live Odds';
       badge.className = 'odds-source-badge real';
     } else {
-      badge.textContent = 'Mock Odds';
+      badge.textContent = 'Simulated Odds';
       badge.className = 'odds-source-badge mock';
     }
   } else {
