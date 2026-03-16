@@ -194,10 +194,22 @@ class OddsScraper:
                 print(f"[SCRAPER] Got REAL odds via TLS impersonation ({len(real_odds)} entries)")
                 return real_odds
         else:
-            print("[SCRAPER] HLTV IP-blocked on this server — skipping HLTV, using OddsPortal")
+            print("[SCRAPER] HLTV IP-blocked — skipping")
 
-        # ── Try 3: HLTV /matches (real team names) + generated odds ────
-        print("[SCRAPER] Falling back to /matches + generated odds")
+        # ── Try 3: The Odds API (real odds, free API key required) ─────
+        real_odds = self._fetch_theoddsapi()
+        if real_odds:
+            print(f"[SCRAPER] Got REAL odds from The Odds API: {len(real_odds)} entries")
+            return real_odds
+
+        # ── Try 4: Strafe.gg (real CS2 odds, no key needed) ────────────
+        real_odds = self._fetch_strafe()
+        if real_odds:
+            print(f"[SCRAPER] Got REAL odds from Strafe.gg: {len(real_odds)} entries")
+            return real_odds
+
+        # ── Try 5: OddsPortal team names + generated odds (fallback) ───
+        print("[SCRAPER] All real-odds sources failed — using generated odds")
         matches = self._fetch_hltv_matches(cookies)
         if not matches:
             matches = self._fetch_oddsportal_matches()
@@ -205,8 +217,219 @@ class OddsScraper:
             print("[SCRAPER] Could not fetch any matches")
             return []
 
-        print(f"[SCRAPER] {len(matches)} matches → generating odds (no real odds available)")
+        print(f"[SCRAPER] {len(matches)} matches → generating odds")
         return self._generate_odds(matches)
+
+    # ──────────────────────────────────────────────────────────────────
+    # SOURCE A: The Odds API — real bookmaker odds via free API key
+    # Sign up free at https://the-odds-api.com  (500 req/month free)
+    # Set ODDS_API_KEY in Railway env vars to enable.
+    # ──────────────────────────────────────────────────────────────────
+
+    def _fetch_theoddsapi(self) -> List[Dict]:
+        api_key = os.environ.get("ODDS_API_KEY", "").strip()
+        if not api_key:
+            return []
+
+        import requests as std_requests  # use standard requests (no CF needed)
+
+        # CS2 sport keys to try in order
+        sport_keys = ["esports_cs2", "esports_csgo", "csgo", "esports"]
+        results = []
+
+        for sport_key in sport_keys:
+            try:
+                r = std_requests.get(
+                    f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
+                    params={
+                        "apiKey":      api_key,
+                        "regions":     "eu,uk,us",
+                        "markets":     "h2h",
+                        "oddsFormat":  "decimal",
+                    },
+                    timeout=15,
+                )
+                print(f"[ODDS-API] {sport_key} → HTTP {r.status_code}")
+                if r.status_code == 404:
+                    continue   # sport key not found, try next
+                if r.status_code == 401:
+                    print("[ODDS-API] Invalid API key — check ODDS_API_KEY env var")
+                    return []
+                if r.status_code != 200:
+                    continue
+
+                data = r.json()
+                if not data:
+                    continue
+
+                print(f"[ODDS-API] {len(data)} matches from sport '{sport_key}'")
+                for match in data:
+                    team_a = match.get("home_team", "")
+                    team_b = match.get("away_team", "")
+                    if not team_a or not team_b:
+                        continue
+                    for bm in match.get("bookmakers", []):
+                        bm_name = bm.get("title") or bm.get("key", "Unknown")
+                        for market in bm.get("markets", []):
+                            if market.get("key") != "h2h":
+                                continue
+                            outcomes = market.get("outcomes", [])
+                            price_map = {o["name"]: o["price"] for o in outcomes if "name" in o}
+                            odds_a = price_map.get(team_a)
+                            odds_b = price_map.get(team_b)
+                            if odds_a and odds_b:
+                                results.append({
+                                    "source":      bm_name,
+                                    "team_a":      team_a,
+                                    "team_b":      team_b,
+                                    "team_a_odds": float(odds_a),
+                                    "team_b_odds": float(odds_b),
+                                    "match_time":  match.get("commence_time",
+                                                             datetime.utcnow().isoformat()),
+                                    "real_odds":   True,
+                                })
+                if results:
+                    return results
+            except Exception as e:
+                print(f"[ODDS-API] Error for {sport_key}: {e}")
+
+        if not results:
+            print("[ODDS-API] No CS2 matches found. "
+                  "Visit https://the-odds-api.com/v4/sports/?apiKey=YOUR_KEY "
+                  "to see available sport keys.")
+        return results
+
+    # ──────────────────────────────────────────────────────────────────
+    # SOURCE B: Strafe.gg — CS2-specific odds aggregator (no key needed)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _fetch_strafe(self) -> List[Dict]:
+        from curl_cffi import requests as cffi_requests
+        if self._session is None:
+            self._session = cffi_requests.Session(impersonate="chrome120")
+
+        results = []
+
+        # Try Strafe.gg JSON API (used by their frontend)
+        api_urls = [
+            "https://strafe.gg/api/v2/matches?sport=csgo&status=upcoming&page=1",
+            "https://strafe.gg/api/matches?sport=cs2&status=upcoming",
+            "https://strafe.gg/api/v1/matches?sport=csgo",
+        ]
+        for url in api_urls:
+            try:
+                r = self._session.get(
+                    url,
+                    timeout=15,
+                    headers={
+                        "User-Agent":  _load_useragent(),
+                        "Accept":      "application/json",
+                        "Referer":     "https://strafe.gg/",
+                    },
+                )
+                print(f"[STRAFE] {url.split('?')[0]} → HTTP {r.status_code}")
+                if r.status_code != 200:
+                    continue
+                try:
+                    data = r.json()
+                except Exception:
+                    continue
+                matches_raw = (data if isinstance(data, list) else
+                               data.get("data") or data.get("matches") or
+                               data.get("result") or [])
+                for m in matches_raw[:30]:
+                    ta = (m.get("team1_name") or m.get("team1", {}).get("name") or
+                          m.get("home", {}).get("name") or m.get("teamA") or "")
+                    tb = (m.get("team2_name") or m.get("team2", {}).get("name") or
+                          m.get("away", {}).get("name") or m.get("teamB") or "")
+                    if not ta or not tb:
+                        continue
+                    # Look for odds in the match object
+                    odds_raw = (m.get("odds") or m.get("bookmakers") or
+                                m.get("betting") or {})
+                    if isinstance(odds_raw, dict):
+                        for bm_name, bm_odds in odds_raw.items():
+                            if isinstance(bm_odds, dict):
+                                oa = bm_odds.get("1") or bm_odds.get("home") or bm_odds.get("team1")
+                                ob = bm_odds.get("2") or bm_odds.get("away") or bm_odds.get("team2")
+                            elif isinstance(bm_odds, list) and len(bm_odds) >= 2:
+                                oa, ob = bm_odds[0], bm_odds[1]
+                            else:
+                                continue
+                            try:
+                                results.append({
+                                    "source":      str(bm_name),
+                                    "team_a":      ta,
+                                    "team_b":      tb,
+                                    "team_a_odds": float(oa),
+                                    "team_b_odds": float(ob),
+                                    "match_time":  m.get("date", datetime.utcnow().isoformat()),
+                                    "real_odds":   True,
+                                })
+                            except (TypeError, ValueError):
+                                pass
+                if results:
+                    print(f"[STRAFE] {len(results)} odds entries")
+                    return results
+            except Exception as e:
+                print(f"[STRAFE] Error: {e}")
+
+        # Fallback: scrape the HTML page for __NEXT_DATA__
+        try:
+            r = self._session.get(
+                "https://strafe.gg/csgo",
+                timeout=15,
+                headers={"User-Agent": _load_useragent(), "Accept": "text/html,*/*"},
+            )
+            print(f"[STRAFE] HTML page → HTTP {r.status_code}, {len(r.text)} chars")
+            if r.status_code == 200:
+                m = re.search(
+                    r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>',
+                    r.text, re.DOTALL
+                )
+                if m:
+                    nd = json.loads(m.group(1))
+                    results = self._extract_strafe_next_data(nd)
+                    if results:
+                        print(f"[STRAFE] NEXT_DATA: {len(results)} entries")
+                        return results
+                print(f"[STRAFE] Snippet: {r.text[1000:1400]!r}")
+        except Exception as e:
+            print(f"[STRAFE] HTML error: {e}")
+
+        return []
+
+    def _extract_strafe_next_data(self, data, depth=0) -> List[Dict]:
+        """Walk Strafe.gg's NEXT_DATA tree looking for match+odds objects."""
+        if depth > 8 or not isinstance(data, (dict, list)):
+            return []
+        results = []
+        if isinstance(data, dict):
+            ta = (data.get("team1_name") or data.get("teamOneName") or
+                  data.get("home_name") or "")
+            tb = (data.get("team2_name") or data.get("teamTwoName") or
+                  data.get("away_name") or "")
+            odds = data.get("odds") or data.get("bookmakers") or {}
+            if ta and tb and isinstance(odds, dict):
+                for bm_name, bm_odds in odds.items():
+                    try:
+                        if isinstance(bm_odds, list) and len(bm_odds) >= 2:
+                            results.append({
+                                "source":      str(bm_name),
+                                "team_a":      ta, "team_b": tb,
+                                "team_a_odds": float(bm_odds[0]),
+                                "team_b_odds": float(bm_odds[1]),
+                                "match_time":  datetime.utcnow().isoformat(),
+                                "real_odds":   True,
+                            })
+                    except (TypeError, ValueError):
+                        pass
+            for v in data.values():
+                results.extend(self._extract_strafe_next_data(v, depth + 1))
+        elif isinstance(data, list):
+            for item in data[:50]:
+                results.extend(self._extract_strafe_next_data(item, depth + 1))
+        return results
 
     # ──────────────────────────────────────────────────────────────────
     # SOURCE 1: HLTV /betting/money — REAL bookmaker odds
