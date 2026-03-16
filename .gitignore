@@ -37,3 +37,7 @@ Thumbs.db
 # Exports / backups
 exports/
 backups/
+
+# HLTV cookies — never commit these
+cookies/hltv_cookies.json
+cookies/hltv_useragent.txt

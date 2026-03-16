@@ -70,6 +70,16 @@
     }
     .ws-status.connected { color: var(--green); }
     .ws-status.disconnected { color: var(--red); }
+    .odds-source-badge {
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      padding: 2px 8px;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+    .odds-source-badge.real  { background: rgba(0,200,100,0.15); color: #00c864; border: 1px solid rgba(0,200,100,0.4); }
+    .odds-source-badge.mock  { background: rgba(255,160,0,0.15);  color: #ffa000; border: 1px solid rgba(255,160,0,0.4); }
     .nav-right { display: flex; align-items: center; gap: 10px; }
     .btn {
       padding: 7px 16px;
@@ -367,6 +377,7 @@
   <div class="nav-center">
     <div class="live-badge"><div class="live-dot"></div>LIVE</div>
     <div class="ws-status disconnected" id="wsStatus">Connecting...</div>
+    <span class="odds-source-badge mock" id="oddsSourceBadge" style="display:none"></span>
   </div>
   <div class="nav-right" id="navRight">
     <button class="btn btn-outline btn-sm" onclick="openModal('login')">Login</button>
@@ -518,7 +529,7 @@ function connectWS() {
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.type === 'update') {
-      renderAll(msg.odds, msg.arbitrage, msg.timestamp, msg.connections);
+      renderAll(msg.odds, msg.arbitrage, msg.timestamp, msg.connections, msg.real_odds);
     }
   };
 
@@ -532,7 +543,7 @@ function connectWS() {
 }
 
 // ── RENDER ALL ────────────────────────────────────────────────────────────────
-function renderAll(odds, arbitrage, timestamp, connections) {
+function renderAll(odds, arbitrage, timestamp, connections, realOdds) {
   // Stats
   const matchMap = groupByMatch(odds);
   const uniqueBooks = new Set(odds.map(o => o.source));
@@ -543,6 +554,21 @@ function renderAll(odds, arbitrage, timestamp, connections) {
   document.getElementById('statUsers').textContent    = connections ?? '—';
   document.getElementById('matchCountBadge').textContent = Object.keys(matchMap).length;
   document.getElementById('arbCountBadge').textContent   = arbitrage.length;
+
+  // Real vs mock odds badge
+  const badge = document.getElementById('oddsSourceBadge');
+  if (odds.length) {
+    badge.style.display = '';
+    if (realOdds) {
+      badge.textContent = 'Live Odds';
+      badge.className = 'odds-source-badge real';
+    } else {
+      badge.textContent = 'Mock Odds';
+      badge.className = 'odds-source-badge mock';
+    }
+  } else {
+    badge.style.display = 'none';
+  }
 
   if (timestamp) {
     const d = new Date(timestamp + 'Z');

@@ -86,6 +86,7 @@ class ConnectionManager:
                 "arbitrage": arbitrage_cache,
                 "timestamp": last_update,
                 "connections": len(self.active_connections),
+                "real_odds": any(d.get("real_odds") for d in live_odds_cache),
             })
 
     def disconnect(self, websocket: WebSocket):
@@ -258,6 +259,7 @@ async def scraper_status():
         "arbitrage_count": len(arbitrage_cache),
         "last_update": last_update,
         "connected_clients": len(manager.active_connections),
+        "real_odds": any(d.get("real_odds") for d in live_odds_cache),
     }
 
 
@@ -292,12 +294,14 @@ async def scraping_loop():
                 last_update = datetime.utcnow().isoformat()
                 last_hash = new_hash
 
+                using_real_odds = any(d.get("real_odds") for d in odds_data)
                 await manager.broadcast({
                     "type": "update",
                     "odds": odds_data,
                     "arbitrage": arbitrage_opps,
                     "timestamp": last_update,
                     "connections": len(manager.active_connections),
+                    "real_odds": using_real_odds,
                 })
                 print(f"Odds changed — {len(odds_data)} entries, {len(arbitrage_opps)} arb opps, pushed to {len(manager.active_connections)} clients")
             else:

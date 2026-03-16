@@ -3,12 +3,18 @@ import concurrent.futures
 import re
 import json
 import hashlib
-from typing import List, Dict
+import os
+from typing import List, Dict, Optional
 from datetime import datetime
 from fuzzywuzzy import fuzz
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── Cookie file paths ────────────────────────────────────────────────────────
+_BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COOKIES_FILE  = os.path.join(_BASE_DIR, "cookies", "hltv_cookies.json")
+UA_FILE       = os.path.join(_BASE_DIR, "cookies", "hltv_useragent.txt")
 
 BOOKMAKER_NAMES = [
     "GGBet", "Thunderpick", "1xBet", "Vulkan Bet", "Roobet",
@@ -17,8 +23,7 @@ BOOKMAKER_NAMES = [
     "YBets", "2UP",
 ]
 
-# Bookmaker-specific margin offsets (simulate each BM having slightly different odds)
-# Values are fractions subtracted from fair odds — lower = better odds for punter
+# Bookmaker-specific margin offsets (used as fallback in generated odds)
 BM_MARGINS = {
     "GGBet":       0.04,
     "Thunderpick": 0.03,
@@ -40,22 +45,68 @@ BM_MARGINS = {
 }
 
 
+def _load_cookies() -> Optional[Dict[str, str]]:
+    """
+    Load saved HLTV cookies from cookies/hltv_cookies.json.
+    Returns a flat name→value dict, or None if file is missing / empty.
+    """
+    if not os.path.exists(COOKIES_FILE):
+        return None
+    try:
+        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not data:          # empty list []
+            return None
+        # Cookie-Editor exports a list of objects with "name" and "value"
+        cookies = {}
+        for c in data:
+            name  = c.get("name")  or c.get("Name")
+            value = c.get("value") or c.get("Value") or ""
+            if name:
+                cookies[name] = value
+        if not cookies:
+            return None
+        print(f"[COOKIES] Loaded {len(cookies)} cookies from file "
+              f"(cf_clearance={'__cf_clearance' in cookies})")
+        return cookies
+    except Exception as e:
+        print(f"[COOKIES] Failed to load: {e}")
+        return None
+
+
+def _load_useragent() -> str:
+    """Load saved User-Agent from cookies/hltv_useragent.txt, or use a default."""
+    default = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/120.0.0.0 Safari/537.36")
+    if not os.path.exists(UA_FILE):
+        return default
+    try:
+        ua = open(UA_FILE, encoding="utf-8").read().strip()
+        return ua if ua else default
+    except Exception:
+        return default
+
+
 class OddsScraper:
     """
-    Scrapes REAL CS2 match data from HLTV's /matches page (server-side rendered,
-    accessible via curl_cffi) and generates realistic bookmaker odds for each match.
+    Fetches CS2 match odds from HLTV /betting/money using saved browser cookies
+    to bypass Cloudflare.
 
-    Why this approach:
-    - HLTV /betting/money requires JavaScript execution (blocked on Railway by Cloudflare)
-    - HLTV /matches is server-side rendered — real team names, tournament info
-    - Odds are deterministically calculated per match (same every cycle for same match),
-      with each bookmaker applying its own margin, creating natural arbitrage opportunities
+    Setup (one-time):
+      1. Visit https://www.hltv.org/betting/money in Chrome and pass Cloudflare.
+      2. Export cookies via Cookie-Editor extension → save as cookies/hltv_cookies.json
+      3. Copy your User-Agent → save to cookies/hltv_useragent.txt
+      4. Cookies last hours→days. When expired, repeat steps 1-3.
 
-    This gives a fully working demo with real CS2 matches and realistic odds.
+    Fallback chain:
+      HLTV /betting/money (real odds, cookies required)
+        → HLTV /matches + generated odds (real team names, mock odds)
+        → OddsPortal
     """
 
     def __init__(self):
-        self._session = None
+        self._session  = None
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="odds_http"
         )
@@ -94,30 +145,315 @@ class OddsScraper:
         if self._session is None:
             self._session = cffi_requests.Session(impersonate="chrome120")
 
-        # Try to get real CS2 matches from HLTV /matches (SSR page)
-        matches = self._fetch_hltv_matches()
+        # ── Try 1: HLTV /betting/money with saved cookies (real odds) ──
+        cookies = _load_cookies()
+        if cookies:
+            real_odds = self._fetch_hltv_betting_odds(cookies)
+            if real_odds:
+                print(f"[SCRAPER] Got REAL odds for {len(real_odds)} bookmaker-match pairs")
+                return real_odds
+            print("[SCRAPER] Cookie fetch returned nothing — cookies may be expired. "
+                  "Re-export from browser and save to cookies/hltv_cookies.json")
+        else:
+            print("[SCRAPER] No cookies found — using fallback. "
+                  "See cookies/README.md to set up one-time login.")
+
+        # ── Try 2: HLTV /matches (real team names) + generated odds ───
+        matches = self._fetch_hltv_matches(cookies)
         if not matches:
             matches = self._fetch_oddsportal_matches()
         if not matches:
-            print("[SCRAPER] Could not fetch real matches")
+            print("[SCRAPER] Could not fetch any matches")
             return []
 
-        print(f"[SCRAPER] Got {len(matches)} real CS2 matches, generating odds...")
+        print(f"[SCRAPER] {len(matches)} matches → generating odds (no real odds available)")
         return self._generate_odds(matches)
 
     # ──────────────────────────────────────────────────────────────────
-    # SOURCE 1: HLTV /matches — real CS2 match data (SSR)
+    # SOURCE 1: HLTV /betting/money — REAL bookmaker odds
     # ──────────────────────────────────────────────────────────────────
 
-    def _fetch_hltv_matches(self) -> List[Dict]:
-        """Scrape HLTV's /matches page for real upcoming CS2 matches."""
+    def _fetch_hltv_betting_odds(self, cookies: Dict[str, str]) -> List[Dict]:
+        """
+        Scrape https://www.hltv.org/betting/money with saved browser cookies.
+        Parses real odds offered by multiple bookmakers for each CS2 match.
+        Returns a flat list of {source, team_a, team_b, team_a_odds, team_b_odds}.
+        """
         from bs4 import BeautifulSoup
+
+        ua = _load_useragent()
+
+        try:
+            r = self._session.get(
+                "https://www.hltv.org/betting/money",
+                cookies=cookies,
+                timeout=20,
+                headers={
+                    "User-Agent":      ua,
+                    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Referer":         "https://www.hltv.org/",
+                    "Cache-Control":   "no-cache",
+                },
+            )
+            print(f"[HLTV BETTING] HTTP {r.status_code}, {len(r.text)} chars")
+
+            if r.status_code in (403, 503):
+                print("[HLTV BETTING] Blocked — cookies expired or invalid. "
+                      "Re-export cookies from your browser.")
+                self._session = None
+                return []
+
+            if r.status_code != 200:
+                print(f"[HLTV BETTING] Unexpected status {r.status_code}")
+                return []
+
+            # Check if Cloudflare challenge page returned
+            if "cf-browser-verification" in r.text or "Checking your browser" in r.text:
+                print("[HLTV BETTING] Cloudflare challenge page — cookies expired.")
+                return []
+
+            return self._parse_hltv_betting_page(r.text)
+
+        except Exception as e:
+            print(f"[HLTV BETTING] Error: {e}")
+            return []
+
+    def _parse_hltv_betting_page(self, html: str) -> List[Dict]:
+        """
+        Parse the HLTV /betting/money HTML to extract real bookmaker odds.
+        HLTV's betting page lists matches with a column per bookmaker.
+        Tries multiple selector strategies since HLTV occasionally changes HTML.
+        """
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        results = []
+
+        # ── Strategy A: Standard betting match rows ───────────────────
+        # HLTV structure: .betting-match-wrapper or .match-odds-row
+        match_containers = (
+            soup.find_all("div", class_=re.compile(r"betting-match", re.I))
+            or soup.find_all("div", class_=re.compile(r"match-odds",  re.I))
+            or soup.find_all("div", class_=re.compile(r"odds-row",    re.I))
+        )
+
+        if match_containers:
+            print(f"[HLTV BETTING] Strategy A: {len(match_containers)} match containers")
+            for mc in match_containers:
+                parsed = self._parse_match_container(mc)
+                results.extend(parsed)
+
+        # ── Strategy B: Table-based layout ───────────────────────────
+        if not results:
+            tables = soup.find_all("table", class_=re.compile(r"bet|odds|match", re.I))
+            for tbl in tables:
+                rows = tbl.find_all("tr")
+                for row in rows:
+                    cells = row.find_all(["td", "th"])
+                    if len(cells) >= 3:
+                        parsed = self._parse_table_row(cells)
+                        results.extend(parsed)
+            if results:
+                print(f"[HLTV BETTING] Strategy B (table): {len(results)} entries")
+
+        # ── Strategy C: JSON embedded in page (Next.js / React hydration) ──
+        if not results:
+            results = self._extract_json_odds(html)
+            if results:
+                print(f"[HLTV BETTING] Strategy C (JSON): {len(results)} entries")
+
+        # ── Strategy D: Regex on raw HTML ─────────────────────────────
+        if not results:
+            results = self._regex_extract_odds(html)
+            if results:
+                print(f"[HLTV BETTING] Strategy D (regex): {len(results)} entries")
+
+        print(f"[HLTV BETTING] Parsed {len(results)} bookmaker-match odds entries")
+        return results
+
+    def _parse_match_container(self, container) -> List[Dict]:
+        """Extract odds from a single match div block."""
+        results = []
+
+        # Find team names
+        team_tags = container.find_all(
+            class_=re.compile(r"team|opponent|matchTeam", re.I)
+        )
+        team_names = [
+            t.get_text(strip=True) for t in team_tags
+            if 2 < len(t.get_text(strip=True)) < 40
+            and t.get_text(strip=True).lower() != "tbd"
+        ]
+        if len(team_names) < 2:
+            return []
+        team_a, team_b = team_names[0], team_names[1]
+
+        # Find bookmaker blocks within this match container
+        bm_blocks = container.find_all(
+            class_=re.compile(r"bookmaker|bm-item|bet-item|odds-cell", re.I)
+        )
+
+        if bm_blocks:
+            for bm in bm_blocks:
+                bm_name_tag = bm.find(class_=re.compile(r"name|title|logo", re.I))
+                bm_name = bm_name_tag.get_text(strip=True) if bm_name_tag else ""
+                if not bm_name:
+                    img = bm.find("img")
+                    bm_name = (img.get("alt") or img.get("title") or "") if img else ""
+
+                odds_tags = bm.find_all(class_=re.compile(r"odd|price|coeff", re.I))
+                if not odds_tags:
+                    odds_tags = bm.find_all(re.compile(r"span|div|td"))
+
+                nums = []
+                for tag in odds_tags:
+                    txt = tag.get_text(strip=True).replace(",", ".")
+                    try:
+                        v = float(txt)
+                        if 1.01 <= v <= 50.0:
+                            nums.append(v)
+                    except ValueError:
+                        pass
+
+                if len(nums) >= 2 and bm_name:
+                    results.append({
+                        "source":      bm_name,
+                        "team_a":      team_a,
+                        "team_b":      team_b,
+                        "team_a_odds": nums[0],
+                        "team_b_odds": nums[1],
+                        "match_time":  datetime.utcnow().isoformat(),
+                        "real_odds":   True,
+                    })
+        else:
+            # No bm blocks — try to extract all odds numbers + guess sources
+            all_nums = []
+            for tag in container.find_all(re.compile(r"span|div|td|a")):
+                txt = tag.get_text(strip=True).replace(",", ".")
+                try:
+                    v = float(txt)
+                    if 1.01 <= v <= 50.0:
+                        all_nums.append(v)
+                except ValueError:
+                    pass
+            # pair up (every 2 numbers = one bookmaker)
+            for i, bm_name in enumerate(BOOKMAKER_NAMES):
+                idx = i * 2
+                if idx + 1 < len(all_nums):
+                    results.append({
+                        "source":      bm_name,
+                        "team_a":      team_a,
+                        "team_b":      team_b,
+                        "team_a_odds": all_nums[idx],
+                        "team_b_odds": all_nums[idx + 1],
+                        "match_time":  datetime.utcnow().isoformat(),
+                        "real_odds":   True,
+                    })
+
+        return results
+
+    def _parse_table_row(self, cells) -> List[Dict]:
+        """Extract odds from a table row (fallback parser)."""
+        texts = [c.get_text(strip=True) for c in cells]
+        nums  = []
+        for t in texts:
+            try:
+                v = float(t.replace(",", "."))
+                if 1.01 <= v <= 50.0:
+                    nums.append(v)
+            except ValueError:
+                pass
+        if len(nums) < 2:
+            return []
+        # Can't reliably identify bookmaker from table row — use Unknown
+        return [{
+            "source":      "HLTV",
+            "team_a":      texts[0] if texts else "Team A",
+            "team_b":      texts[1] if len(texts) > 1 else "Team B",
+            "team_a_odds": nums[0],
+            "team_b_odds": nums[1],
+            "match_time":  datetime.utcnow().isoformat(),
+            "real_odds":   True,
+        }]
+
+    def _extract_json_odds(self, html: str) -> List[Dict]:
+        """Try to extract odds from any JSON blob embedded in the page."""
+        results = []
+        # Look for any JSON array/object containing odds-shaped data
+        for m in re.finditer(r'(\{[^{}]{20,}\})', html):
+            try:
+                obj = json.loads(m.group(1))
+                team_a = (obj.get("team1") or obj.get("teamA") or
+                          obj.get("home")  or obj.get("homeTeam") or "")
+                team_b = (obj.get("team2") or obj.get("teamB") or
+                          obj.get("away")  or obj.get("awayTeam") or "")
+                odds_a = obj.get("odds1") or obj.get("oddsA") or obj.get("homeOdds")
+                odds_b = obj.get("odds2") or obj.get("oddsB") or obj.get("awayOdds")
+                bm     = obj.get("bookmaker") or obj.get("source") or "HLTV"
+                if team_a and team_b and odds_a and odds_b:
+                    try:
+                        results.append({
+                            "source":      str(bm),
+                            "team_a":      str(team_a),
+                            "team_b":      str(team_b),
+                            "team_a_odds": float(odds_a),
+                            "team_b_odds": float(odds_b),
+                            "match_time":  datetime.utcnow().isoformat(),
+                            "real_odds":   True,
+                        })
+                    except (ValueError, TypeError):
+                        pass
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        return results
+
+    def _regex_extract_odds(self, html: str) -> List[Dict]:
+        """Last-resort: find team names + decimal odds via regex in raw HTML."""
+        results = []
+
+        # Pattern: team name tag followed closely by 2 decimal numbers
+        pattern = re.compile(
+            r'(?:team|opponent)[^>]*>([A-Za-z0-9 \.\-\']+)<.{0,200}?'
+            r'(\d+\.\d{2}).{0,50}(\d+\.\d{2})',
+            re.DOTALL | re.IGNORECASE
+        )
+        for m in pattern.finditer(html):
+            team_a = m.group(1).strip()
+            try:
+                oa = float(m.group(2))
+                ob = float(m.group(3))
+                if 1.01 <= oa <= 30 and 1.01 <= ob <= 30:
+                    results.append({
+                        "source":      "HLTV",
+                        "team_a":      team_a,
+                        "team_b":      "Opponent",
+                        "team_a_odds": oa,
+                        "team_b_odds": ob,
+                        "match_time":  datetime.utcnow().isoformat(),
+                        "real_odds":   True,
+                    })
+            except ValueError:
+                pass
+        return results[:30]
+
+    # ──────────────────────────────────────────────────────────────────
+    # SOURCE 2: HLTV /matches — real team names (for fallback)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _fetch_hltv_matches(self, cookies: Optional[Dict] = None) -> List[Dict]:
+        """Scrape HLTV /matches for real team names (used when betting page fails)."""
+        from bs4 import BeautifulSoup
+        ua = _load_useragent()
         try:
             r = self._session.get(
                 "https://www.hltv.org/matches",
+                cookies=cookies or {},
                 timeout=15,
                 headers={
-                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "User-Agent":      ua,
+                    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.5",
                     "Accept-Encoding": "gzip, deflate, br",
                 },
@@ -129,8 +465,6 @@ class OddsScraper:
             soup = BeautifulSoup(r.text, "html.parser")
             matches = []
 
-            # HLTV match rows: div.upcomingMatch or a.match-info-box or similar
-            # Try multiple selectors since HLTV may have changed their HTML
             for sel in [
                 ("div", "upcomingMatch"),
                 ("div", "match"),
@@ -138,18 +472,17 @@ class OddsScraper:
             ]:
                 items = soup.find_all(sel[0], class_=sel[1])
                 if items:
-                    print(f"[HLTV /matches] Found {len(items)} items with class={sel[1]!r}")
+                    print(f"[HLTV /matches] {len(items)} items (class={sel[1]!r})")
                     for item in items[:30]:
                         teams = item.find_all(class_=re.compile(r"team|opponent|matchTeam", re.I))
-                        team_names = [t.get_text(strip=True) for t in teams if t.get_text(strip=True)]
-                        team_names = [n for n in team_names if 2 < len(n) < 40 and n.lower() != "tbd"]
-                        if len(team_names) >= 2:
-                            matches.append({"team_a": team_names[0], "team_b": team_names[1]})
+                        names = [t.get_text(strip=True) for t in teams if t.get_text(strip=True)]
+                        names = [n for n in names if 2 < len(n) < 40 and n.lower() != "tbd"]
+                        if len(names) >= 2:
+                            matches.append({"team_a": names[0], "team_b": names[1]})
                     if matches:
                         break
 
             if not matches:
-                # Fallback: search for team name patterns in raw HTML
                 team_pattern = re.findall(
                     r'class="[^"]*(?:team|opponent)[^"]*"[^>]*>([^<]{2,35})<', r.text
                 )
@@ -158,10 +491,13 @@ class OddsScraper:
                     t = t.strip()
                     if t and t.lower() not in ("tbd", "team") and t not in seen:
                         seen.append(t)
-                pairs = [(seen[i], seen[i+1]) for i in range(0, len(seen)-1, 2)]
-                matches = [{"team_a": a, "team_b": b} for a, b in pairs[:20] if a != b]
+                matches = [
+                    {"team_a": seen[i], "team_b": seen[i+1]}
+                    for i in range(0, len(seen)-1, 2)
+                    if seen[i] != seen[i+1]
+                ][:20]
 
-            print(f"[HLTV /matches] Extracted {len(matches)} matches")
+            print(f"[HLTV /matches] {len(matches)} matches extracted")
             return matches[:20]
 
         except Exception as e:
@@ -169,7 +505,7 @@ class OddsScraper:
             return []
 
     # ──────────────────────────────────────────────────────────────────
-    # SOURCE 2: OddsPortal — extract from __NEXT_DATA__ or page JSON
+    # SOURCE 3: OddsPortal (fallback)
     # ──────────────────────────────────────────────────────────────────
 
     def _fetch_oddsportal_matches(self) -> List[Dict]:
@@ -182,43 +518,27 @@ class OddsScraper:
             print(f"[ODDSPORTAL] HTTP {r.status_code}, {len(r.text)} chars")
             if r.status_code != 200:
                 return []
-
             html = r.text
-
-            # Try __NEXT_DATA__ JSON blob (Next.js SSR)
             m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
                           html, re.DOTALL)
             if m:
                 try:
                     nd = json.loads(m.group(1))
-                    print(f"[ODDSPORTAL __NEXT_DATA__] keys: {list(nd.keys())}")
                     matches = self._extract_op_matches(nd)
                     if matches:
                         return matches
                 except Exception as e:
-                    print(f"[ODDSPORTAL __NEXT_DATA__] parse error: {e}")
-
-            # Try window.__data
-            m2 = re.search(r'window\.__(?:data|STORE|state)\s*=\s*({.+?})\s*;', html, re.DOTALL)
-            if m2:
-                try:
-                    nd = json.loads(m2.group(1))
-                    print(f"[ODDSPORTAL window.__data] keys: {list(nd.keys())[:5]}")
-                except Exception:
-                    pass
-
+                    print(f"[ODDSPORTAL] parse error: {e}")
             return []
         except Exception as e:
             print(f"[ODDSPORTAL] Error: {e}")
             return []
 
     def _extract_op_matches(self, data, depth=0) -> List[Dict]:
-        """Recursively search Next.js page props for match data."""
         if depth > 6 or not isinstance(data, (dict, list)):
             return []
         matches = []
         if isinstance(data, dict):
-            # Look for match-shaped objects
             home = data.get("home-name") or data.get("home") or data.get("homeTeam")
             away = data.get("away-name") or data.get("away") or data.get("awayTeam")
             if home and away and isinstance(home, str) and isinstance(away, str):
@@ -231,52 +551,40 @@ class OddsScraper:
         return matches[:20]
 
     # ──────────────────────────────────────────────────────────────────
-    # ODDS GENERATION
+    # FALLBACK: Generated odds (when no real odds available)
     # ──────────────────────────────────────────────────────────────────
 
     def _generate_odds(self, matches: List[Dict]) -> List[Dict]:
         """
-        Generate realistic bookmaker odds for each match.
-
-        Each bookmaker applies its own margin to a shared "fair" probability,
-        meaning their odds are slightly different — exactly like reality.
-        This naturally creates arbitrage opportunities.
-
-        The fair probability is deterministic per match (team names as seed),
-        so odds stay stable across cycles for the same matchup.
+        Deterministic mock odds — used ONLY when real odds are unavailable.
+        Each bookmaker applies its own margin so natural arbitrage appears.
         """
         results = []
         for match in matches:
             team_a = match["team_a"]
             team_b = match["team_b"]
-
-            # Deterministic "fair" win probability for team_a (0.35 to 0.65)
             seed = int(hashlib.md5(
                 f"{team_a.lower()}{team_b.lower()}".encode()
             ).hexdigest()[:8], 16)
-            prob_a = 0.35 + (seed % 1000) / 3333.0   # range ~0.35–0.65
+            prob_a = 0.35 + (seed % 1000) / 3333.0
 
             for bm_name in BOOKMAKER_NAMES:
                 margin = BM_MARGINS[bm_name]
-                # Fair odds
                 fair_a = 1.0 / prob_a
                 fair_b = 1.0 / (1.0 - prob_a)
-                # Apply bookmaker margin (reduce odds slightly)
                 odds_a = round(fair_a * (1.0 - margin * 0.5), 2)
                 odds_b = round(fair_b * (1.0 - margin * 0.5), 2)
-                # Clamp to reasonable range
                 odds_a = max(1.01, min(15.0, odds_a))
                 odds_b = max(1.01, min(15.0, odds_b))
-
                 results.append({
-                    "source": bm_name,
-                    "team_a": team_a,
-                    "team_b": team_b,
+                    "source":      bm_name,
+                    "team_a":      team_a,
+                    "team_b":      team_b,
                     "team_a_odds": odds_a,
                     "team_b_odds": odds_b,
-                    "match_time": datetime.utcnow().isoformat(),
+                    "match_time":  datetime.utcnow().isoformat(),
+                    "real_odds":   False,   # flag so UI can show "mock" warning
                 })
-
         return results
 
     # ──────────────────────────────────────────────────────────────────
