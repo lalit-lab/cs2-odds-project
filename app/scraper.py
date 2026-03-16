@@ -45,40 +45,70 @@ BM_MARGINS = {
 }
 
 
+def _parse_cookie_list(data) -> Optional[Dict[str, str]]:
+    """Convert a Cookie-Editor JSON list → flat name:value dict."""
+    if not data:
+        return None
+    cookies = {}
+    for c in data:
+        name  = c.get("name")  or c.get("Name")
+        value = c.get("value") or c.get("Value") or ""
+        if name:
+            cookies[name] = value
+    if not cookies:
+        return None
+    print(f"[COOKIES] Loaded {len(cookies)} cookies "
+          f"(cf_clearance={'__cf_clearance' in cookies})")
+    return cookies
+
+
 def _load_cookies() -> Optional[Dict[str, str]]:
     """
-    Load saved HLTV cookies from cookies/hltv_cookies.json.
-    Returns a flat name→value dict, or None if file is missing / empty.
+    Load HLTV cookies.  Priority:
+      1. HLTV_COOKIES_JSON env var  (Railway / any cloud host)
+      2. cookies/hltv_cookies.json  (local dev)
+    Returns a flat name→value dict, or None if nothing is configured.
     """
+    # ── 1. Environment variable (Railway) ────────────────────────────
+    raw = os.environ.get("HLTV_COOKIES_JSON", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            result = _parse_cookie_list(data)
+            if result:
+                print("[COOKIES] Source: HLTV_COOKIES_JSON env var")
+                return result
+        except Exception as e:
+            print(f"[COOKIES] HLTV_COOKIES_JSON parse error: {e}")
+
+    # ── 2. Local file ────────────────────────────────────────────────
     if not os.path.exists(COOKIES_FILE):
         return None
     try:
         with open(COOKIES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not data:          # empty list []
-            return None
-        # Cookie-Editor exports a list of objects with "name" and "value"
-        cookies = {}
-        for c in data:
-            name  = c.get("name")  or c.get("Name")
-            value = c.get("value") or c.get("Value") or ""
-            if name:
-                cookies[name] = value
-        if not cookies:
-            return None
-        print(f"[COOKIES] Loaded {len(cookies)} cookies from file "
-              f"(cf_clearance={'__cf_clearance' in cookies})")
-        return cookies
+        result = _parse_cookie_list(data)
+        if result:
+            print("[COOKIES] Source: cookies/hltv_cookies.json file")
+        return result
     except Exception as e:
-        print(f"[COOKIES] Failed to load: {e}")
+        print(f"[COOKIES] Failed to load file: {e}")
         return None
 
 
 def _load_useragent() -> str:
-    """Load saved User-Agent from cookies/hltv_useragent.txt, or use a default."""
+    """
+    Load User-Agent.  Priority:
+      1. HLTV_USERAGENT env var  (Railway)
+      2. cookies/hltv_useragent.txt  (local dev)
+      3. Built-in Chrome 120 default
+    """
     default = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) "
                "Chrome/120.0.0.0 Safari/537.36")
+    ua = os.environ.get("HLTV_USERAGENT", "").strip()
+    if ua:
+        return ua
     if not os.path.exists(UA_FILE):
         return default
     try:
