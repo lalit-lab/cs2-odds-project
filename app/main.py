@@ -14,6 +14,7 @@ from app.database import get_db, init_db, User
 from app.scraper import OddsScraper
 from app.analysis import OddsAnalyzer
 from app.telegram_bot import TelegramNotifier
+from app.cricket_fetcher import CricketFetcher
 from app.auth import (
     UserCreate, UserResponse, Token,
     get_password_hash, verify_password,
@@ -38,6 +39,10 @@ app.add_middleware(
 scraper = OddsScraper()
 analyzer = OddsAnalyzer()
 telegram_bot = TelegramNotifier()
+cricket_fetcher = CricketFetcher()
+
+# Cricket cache
+cricket_cache = {"matches": [], "requests_remaining": None, "last_update": None, "error": None}
 
 # In-memory cache
 live_odds_cache = []
@@ -153,6 +158,30 @@ async def health_check():
 async def get_bookmakers():
     """Return bookmaker names and their URLs for frontend links."""
     return {"bookmakers": BOOKMAKER_URLS}
+
+
+@app.get("/api/cricket/odds")
+async def get_cricket_odds(refresh: bool = False):
+    """Return cached cricket odds. Pass ?refresh=true to force re-fetch."""
+    global cricket_cache
+
+    # Refresh if explicitly requested or cache is empty
+    if refresh or not cricket_cache["matches"]:
+        result = await cricket_fetcher.fetch_cricket_odds()
+        cricket_cache = {
+            "matches": result["matches"],
+            "requests_remaining": result.get("requests_remaining"),
+            "last_update": datetime.utcnow().isoformat(),
+            "error": result.get("error"),
+        }
+
+    return {
+        "count": len(cricket_cache["matches"]),
+        "data": cricket_cache["matches"],
+        "requests_remaining": cricket_cache["requests_remaining"],
+        "last_update": cricket_cache["last_update"],
+        "error": cricket_cache["error"],
+    }
 
 
 # WebSocket endpoint

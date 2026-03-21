@@ -453,12 +453,16 @@
   <!-- TAB NAVIGATION -->
   <div class="main-tabs">
     <div class="main-tab active" id="tabMatches" onclick="switchMainTab('matches')">
-      CS2 Matches
+      🎮 CS2 Matches
       <span class="tab-badge" id="matchCountBadge">0</span>
     </div>
     <div class="main-tab" id="tabArbitrage" onclick="switchMainTab('arbitrage')">
       Arbitrage Opportunities
       <span class="tab-badge" id="arbCountBadge">0</span>
+    </div>
+    <div class="main-tab" id="tabCricket" onclick="switchMainTab('cricket')">
+      🏏 Cricket Odds
+      <span class="tab-badge" id="cricketCountBadge">0</span>
     </div>
   </div>
 
@@ -476,6 +480,17 @@
   <div class="tab-panel" id="panelArbitrage">
     <div id="arbContainer">
       <div class="no-data">No arbitrage opportunities found yet...</div>
+    </div>
+  </div>
+
+  <!-- CRICKET TAB -->
+  <div class="tab-panel" id="panelCricket">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <span id="cricketApiStatus" style="font-size:0.78rem;color:var(--muted);"></span>
+      <button class="btn btn-outline btn-sm" onclick="loadCricketOdds(true)">⟳ Refresh</button>
+    </div>
+    <div id="cricketContainer">
+      <div class="no-data">Loading live cricket odds...</div>
     </div>
   </div>
 
@@ -556,12 +571,126 @@ let prevOddsSnapshot = {};   // key: "teamA|||teamB|||source", value: {a, b}
 
 // ── MAIN TAB SWITCHING ────────────────────────────────────────────────────────
 function switchMainTab(tab) {
-  ['matches','arbitrage'].forEach(t => {
+  ['matches','arbitrage','cricket'].forEach(t => {
     document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1))
       .classList.toggle('active', t === tab);
     document.getElementById('panel' + t.charAt(0).toUpperCase() + t.slice(1))
       .classList.toggle('active', t === tab);
   });
+  if (tab === 'cricket') loadCricketOdds(false);
+}
+
+// ── CRICKET ODDS ──────────────────────────────────────────────────────────────
+let cricketLoaded = false;
+
+async function loadCricketOdds(forceRefresh) {
+  if (cricketLoaded && !forceRefresh) return;
+  const container = document.getElementById('cricketContainer');
+  const statusEl  = document.getElementById('cricketApiStatus');
+  container.innerHTML = '<div class="loading"><div class="spinner"></div>Fetching live cricket odds...</div>';
+  try {
+    const url = forceRefresh ? '/api/cricket/odds?refresh=true' : '/api/cricket/odds';
+    const res  = await fetch(url);
+    const data = await res.json();
+
+    if (data.error && !data.data?.length) {
+      container.innerHTML = `<div class="no-data">Error: ${data.error}</div>`;
+      return;
+    }
+
+    const remaining = data.requests_remaining;
+    if (remaining !== null && remaining !== undefined) {
+      statusEl.textContent = `API quota remaining: ${remaining} requests`;
+    }
+    if (data.last_update) {
+      const d = new Date(data.last_update + 'Z');
+      statusEl.textContent += (statusEl.textContent ? ' · ' : '') + 'Updated: ' + d.toLocaleTimeString();
+    }
+
+    document.getElementById('cricketCountBadge').textContent = data.count || 0;
+    cricketLoaded = true;
+
+    if (!data.data || data.data.length === 0) {
+      container.innerHTML = '<div class="no-data">No live cricket matches found right now. Try again later.</div>';
+      return;
+    }
+
+    renderCricket(data.data);
+  } catch(e) {
+    container.innerHTML = `<div class="no-data">Failed to load cricket odds: ${e.message}</div>`;
+  }
+}
+
+function renderCricket(matches) {
+  const container = document.getElementById('cricketContainer');
+
+  // Group by match (team_a + team_b)
+  const matchMap = {};
+  matches.forEach(m => {
+    const key = `${m.team_a}|||${m.team_b}|||${m.sport}`;
+    if (!matchMap[key]) matchMap[key] = { team_a: m.team_a, team_b: m.team_b, sport: m.sport, match_time: m.match_time, entries: [] };
+    matchMap[key].entries.push(m);
+  });
+
+  if (!Object.keys(matchMap).length) {
+    container.innerHTML = '<div class="no-data">No live cricket matches found.</div>';
+    return;
+  }
+
+  const html = Object.values(matchMap).map(match => {
+    const bookmakers = [...new Set(match.entries.map(e => e.source))].sort();
+    const oddsMapA = {}, oddsMapB = {};
+    match.entries.forEach(e => { oddsMapA[e.source] = e.team_a_odds; oddsMapB[e.source] = e.team_b_odds; });
+
+    const bestA = Math.max(...Object.values(oddsMapA).filter(v => v));
+    const bestB = Math.max(...Object.values(oddsMapB).filter(v => v));
+
+    const matchDate = match.match_time ? new Date(match.match_time).toLocaleString() : '';
+
+    const headerRow = `<tr>
+      <th style="text-align:left;padding-left:16px">Team</th>
+      ${bookmakers.map(bm => `<th>${bm}</th>`).join('')}
+    </tr>`;
+
+    const rowA = `<tr>
+      <td class="team-cell">${match.team_a}</td>
+      ${bookmakers.map(bm => {
+        const v = oddsMapA[bm];
+        if (!v) return `<td><span class="odd-value empty">—</span></td>`;
+        const cls = v === bestA ? 'best' : 'normal';
+        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}</span></td>`;
+      }).join('')}
+    </tr>`;
+
+    const rowB = `<tr>
+      <td class="team-cell">${match.team_b}</td>
+      ${bookmakers.map(bm => {
+        const v = oddsMapB[bm];
+        if (!v) return `<td><span class="odd-value empty">—</span></td>`;
+        const cls = v === bestB ? 'best' : 'normal';
+        return `<td><span class="odd-value ${cls}">${v.toFixed(2)}</span></td>`;
+      }).join('')}
+    </tr>`;
+
+    return `<div class="match-card">
+      <div class="match-header">
+        <div class="match-title">${match.team_a} <span class="vs">vs</span> ${match.team_b}</div>
+        <div class="match-meta">
+          <span class="tag" style="background:rgba(0,180,80,0.15);color:#3fb950;border-color:rgba(0,180,80,0.4)">🏏 ${match.sport || 'Cricket'}</span>
+          <span>${bookmakers.length} bookmakers</span>
+          ${matchDate ? `<span>${matchDate}</span>` : ''}
+        </div>
+      </div>
+      <div class="odds-table-wrapper">
+        <table class="odds-table">
+          <thead>${headerRow}</thead>
+          <tbody>${rowA}${rowB}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }).join('');
+
+  container.innerHTML = html;
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
