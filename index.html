@@ -489,6 +489,21 @@
       <span id="cricketApiStatus" style="font-size:0.78rem;color:var(--muted);"></span>
       <button class="btn btn-outline btn-sm" onclick="loadCricketOdds(true)">⟳ Refresh</button>
     </div>
+
+    <!-- Cricket Arbitrage Section -->
+    <div class="section-title">
+      🏏 Cricket Arbitrage Opportunities
+      <span class="count-badge" id="cricketArbCountBadge">0</span>
+    </div>
+    <div id="cricketArbContainer">
+      <div class="no-data">No cricket arbitrage opportunities found yet...</div>
+    </div>
+
+    <!-- Cricket Matches Section -->
+    <div class="section-title" style="margin-top:28px;">
+      Cricket Matches &amp; Odds
+      <span class="count-badge" id="cricketMatchCountBadge">0</span>
+    </div>
     <div id="cricketContainer">
       <div class="no-data">Loading live cricket odds...</div>
     </div>
@@ -585,40 +600,86 @@ let cricketLoaded = false;
 
 async function loadCricketOdds(forceRefresh) {
   if (cricketLoaded && !forceRefresh) return;
-  const container = document.getElementById('cricketContainer');
-  const statusEl  = document.getElementById('cricketApiStatus');
-  container.innerHTML = '<div class="loading"><div class="spinner"></div>Fetching live cricket odds...</div>';
+  const container    = document.getElementById('cricketContainer');
+  const arbContainer = document.getElementById('cricketArbContainer');
+  const statusEl     = document.getElementById('cricketApiStatus');
+
+  container.innerHTML    = '<div class="loading"><div class="spinner"></div>Fetching live cricket odds...</div>';
+  arbContainer.innerHTML = '<div class="loading"><div class="spinner"></div>Checking for arbitrage...</div>';
+
+  const qs = forceRefresh ? '?refresh=true' : '';
+
+  // Fetch odds and arbitrage in parallel
   try {
-    const url = forceRefresh ? '/api/cricket/odds?refresh=true' : '/api/cricket/odds';
-    const res  = await fetch(url);
-    const data = await res.json();
+    const [oddsRes, arbRes] = await Promise.all([
+      fetch('/api/cricket/odds' + qs),
+      fetch('/api/cricket/arbitrage' + qs),
+    ]);
+    const [oddsData, arbData] = await Promise.all([oddsRes.json(), arbRes.json()]);
 
-    if (data.error && !data.data?.length) {
-      container.innerHTML = `<div class="no-data">Error: ${data.error}</div>`;
-      return;
-    }
-
-    const remaining = data.requests_remaining;
+    // Status bar
+    const remaining = oddsData.requests_remaining;
     if (remaining !== null && remaining !== undefined) {
       statusEl.textContent = `API quota remaining: ${remaining} requests`;
     }
-    if (data.last_update) {
-      const d = new Date(data.last_update + 'Z');
+    if (oddsData.last_update) {
+      const d = new Date(oddsData.last_update + 'Z');
       statusEl.textContent += (statusEl.textContent ? ' · ' : '') + 'Updated: ' + d.toLocaleTimeString();
     }
 
-    document.getElementById('cricketCountBadge').textContent = data.count || 0;
+    // Update badges
+    document.getElementById('cricketCountBadge').textContent      = oddsData.count || 0;
+    document.getElementById('cricketMatchCountBadge').textContent  = oddsData.count || 0;
+    document.getElementById('cricketArbCountBadge').textContent    = arbData.count  || 0;
+
     cricketLoaded = true;
 
-    if (!data.data || data.data.length === 0) {
-      container.innerHTML = '<div class="no-data">No live cricket matches found right now. Try again later.</div>';
-      return;
-    }
+    // Render arbitrage
+    renderCricketArbitrage(arbData.data || []);
 
-    renderCricket(data.data);
+    // Render matches
+    if (!oddsData.data || oddsData.data.length === 0) {
+      container.innerHTML = '<div class="no-data">No live cricket matches found right now. Try again later.</div>';
+    } else {
+      renderCricket(oddsData.data);
+    }
   } catch(e) {
-    container.innerHTML = `<div class="no-data">Failed to load cricket odds: ${e.message}</div>`;
+    container.innerHTML    = `<div class="no-data">Failed to load cricket odds: ${e.message}</div>`;
+    arbContainer.innerHTML = `<div class="no-data">Failed to load arbitrage data.</div>`;
   }
+}
+
+// ── RENDER CRICKET ARBITRAGE ──────────────────────────────────────────────────
+function renderCricketArbitrage(arbs) {
+  const container = document.getElementById('cricketArbContainer');
+  if (!arbs.length) {
+    container.innerHTML = '<div class="no-data">No cricket arbitrage opportunities found.</div>';
+    return;
+  }
+  container.innerHTML = `<table class="arb-table">
+    <thead><tr>
+      <th>Match</th>
+      <th>Profit</th>
+      <th>Team A Best Odds</th>
+      <th>Team B Best Odds</th>
+      <th>Stake Split</th>
+    </tr></thead>
+    <tbody>
+      ${arbs.map(a => `<tr>
+        <td><strong>${a.team_a}</strong> vs ${a.team_b}</td>
+        <td><span class="profit-badge">+${a.profit_percent}%</span></td>
+        <td>
+          <strong>${a.best_odds_a}</strong>
+          <div class="arb-source">via ${a.source_a}</div>
+        </td>
+        <td>
+          <strong>${a.best_odds_b}</strong>
+          <div class="arb-source">via ${a.source_b}</div>
+        </td>
+        <td>${a.stake_a_percent}% / ${a.stake_b_percent}%</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`;
 }
 
 function renderCricket(matches) {

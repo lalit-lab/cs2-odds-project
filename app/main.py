@@ -184,6 +184,29 @@ async def get_cricket_odds(refresh: bool = False):
     }
 
 
+@app.get("/api/cricket/arbitrage")
+async def get_cricket_arbitrage(refresh: bool = False):
+    """Detect arbitrage opportunities in live cricket odds."""
+    global cricket_cache
+
+    # Reuse cached data or fetch fresh
+    if refresh or not cricket_cache["matches"]:
+        result = await cricket_fetcher.fetch_cricket_odds()
+        cricket_cache = {
+            "matches": result["matches"],
+            "requests_remaining": result.get("requests_remaining"),
+            "last_update": datetime.utcnow().isoformat(),
+            "error": result.get("error"),
+        }
+
+    arb_opps = analyzer.detect_arbitrage(cricket_cache["matches"])
+    return {
+        "count": len(arb_opps),
+        "data": arb_opps,
+        "last_update": cricket_cache["last_update"],
+    }
+
+
 # WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
